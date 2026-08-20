@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "speechlab"
-version = "0.2.0"
+version = "0.3.0"
 description = "An LLM research agent for speech science: a tool-calling assistant grounded in locally measured acoustics (F0, formants, jitter/shimmer, HNR)."
 readme = "README.md"
 license = { text = "MIT" }

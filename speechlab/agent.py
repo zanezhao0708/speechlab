@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -67,6 +69,10 @@ class AgentConfig:
     temperature: float = 0.3
     max_tool_rounds: int = 6
     timeout_s: float = 120.0
+    max_retries: int = 2
+    """Retries (beyond the first attempt) for transient transport errors."""
+    retry_backoff_s: float = 1.0
+    """Base backoff delay; doubles after each failed attempt."""
 
     def validate(self) -> None:
         if not self.api_key:
@@ -109,6 +115,10 @@ def _safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=default)
 
 
+#: HTTP status codes worth retrying: request timeout, rate limit, server errors
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
 class SpeechResearchAgent:
     """A tool-using LLM assistant for speech research."""
 
@@ -120,6 +130,7 @@ class SpeechResearchAgent:
         self.tools = tools if tools is not None else self.default_tools()
         self.tool_specs = build_tool_specs()
         self.history: list[dict] = []
+        self._tool_cache: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # local tools the model can call
@@ -135,6 +146,7 @@ class SpeechResearchAgent:
     # transport
     # ------------------------------------------------------------------
     def _chat_request(self, messages: list[dict], tools: list[dict] | None) -> dict:
+        """POST one chat completion, retrying transient transport errors."""
         cfg = self.config
         cfg.validate()
         url = cfg.base_url.rstrip("/") + "/chat/completions"
@@ -154,14 +166,38 @@ class SpeechResearchAgent:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+
+        last_exc: Exception | None = None
+        for attempt in range(cfg.max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.timeout_s) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _RETRYABLE_STATUS:
+                    raise  # auth/argument errors will not fix themselves
+                last_exc = exc
+            except urllib.error.URLError as exc:
+                last_exc = exc  # connection reset, DNS hiccup, timeouts ...
+            if attempt < cfg.max_retries:
+                time.sleep(cfg.retry_backoff_s * (2 ** attempt))
+        assert last_exc is not None
+        raise last_exc
 
     # ------------------------------------------------------------------
     # agentic loop
     # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """Clear the conversation history and tool cache."""
+        self.history = []
+        self._tool_cache.clear()
+
     def ask(self, question: str, context: dict | None = None) -> str:
         """Ask a research question; returns the assistant's final answer.
+
+        Conversations are multi-turn: previous exchanges are kept in
+        :attr:`history` and sent along with each new question, so follow-ups
+        like "now compare it with the other file" work.  Call
+        :meth:`reset` to start fresh.
 
         Parameters
         ----------
@@ -174,11 +210,9 @@ class SpeechResearchAgent:
         if context:
             user_content += "\n\nAttached analysis context:\n" + _safe_json(context)
 
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        self.history = list(messages)
+        if not self.history:
+            self.history = [{"role": "system", "content": self.system_prompt}]
+        messages = self.history + [{"role": "user", "content": user_content}]
 
         for _round in range(cfg.max_tool_rounds):
             response = self._chat_request(messages, self.tool_specs)
@@ -221,14 +255,28 @@ class SpeechResearchAgent:
 
     def _execute_tool(self, call: dict) -> str:
         name = call["function"]["name"]
+        raw_args = call["function"].get("arguments") or "{}"
+
+        # models sometimes re-request the same analysis within one session;
+        # cached results keep that cheap
+        cache_key = f"{name}:{raw_args}"
+        cached = self._tool_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
-            args = json.loads(call["function"].get("arguments") or "{}")
+            args = json.loads(raw_args)
         except json.JSONDecodeError:
             return json.dumps({"error": "arguments were not valid JSON"})
         if name not in self.tools:
             return json.dumps({"error": f"unknown tool: {name}"})
         try:
             result = self.tools[name](args)
-            return _safe_json(result)
+            out = _safe_json(result)
         except Exception as exc:  # noqa: BLE001 — surface tool errors to the model
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+
+        if len(self._tool_cache) >= 64:
+            self._tool_cache.clear()
+        self._tool_cache[cache_key] = out
+        return out

@@ -12,7 +12,7 @@ agent    : the LLM research assistant with the tool-calling loop.
 cli      : command line interface.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",

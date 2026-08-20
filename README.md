@@ -73,10 +73,19 @@ agent = SpeechResearchAgent(AgentConfig(
     model="gpt-4o-mini",
 ))
 print(agent.ask("Compare the F0 statistics of ./a.wav and ./b.wav"))
+
+# conversations are multi-turn — follow-ups keep the context:
+agent.ask("Now which of the two has the more stable voice?")
+agent.reset()  # start fresh
+
 print(agent.ask("Is this voice measurement pathological?", context={
     "audio_analysis": analyze(load_audio("patient.wav")),
 }))
 ```
+
+Transient transport errors (rate limits, 5xx, connection resets) are
+retried automatically with exponential backoff; repeated tool calls on the
+same file reuse cached analysis results.
 
 Configuration via environment variables:
 

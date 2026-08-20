@@ -273,12 +273,13 @@ class JitterShimmer:
 
 
 def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
-                 fmax: float = 500.0) -> tuple[np.ndarray, np.ndarray]:
+                 fmax: float = 500.0,
+                 track: F0Track | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Locate glottal pulse epochs (waveform peaks) for perturbation measures.
 
-    A rough F0 is estimated first, the signal is low-pass smoothed over a
-    quarter period to suppress formant ripple, and peaks are then picked with
-    a minimum spacing of 0.6·period.
+    A rough F0 is estimated first (or reused from ``track``), the signal is
+    low-pass smoothed over a quarter period to suppress formant ripple, and
+    peaks are then picked with a minimum spacing of 0.6·period.
 
     Returns ``(epoch_indices, peak_amplitudes)``.
     """
@@ -286,7 +287,8 @@ def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
     if len(x) < int(sr / fmin) * 3:
         return np.empty(0, dtype=int), np.empty(0)
 
-    track = f0_track(x, sr, fmin=fmin, fmax=fmax)
+    if track is None:
+        track = f0_track(x, sr, fmin=fmin, fmax=fmax)
     voiced_f0 = track.f0[track.voiced]
     if len(voiced_f0) == 0:
         return np.empty(0, dtype=int), np.empty(0)
@@ -332,13 +334,15 @@ def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
 
 
 def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
-                   fmax: float = 500.0) -> JitterShimmer:
+                   fmax: float = 500.0,
+                   track: F0Track | None = None) -> JitterShimmer:
     """Local jitter (%) and shimmer (dB) from consecutive glottal periods.
 
     Typical sustained-vowel values: jitter < 1 %, shimmer < 0.4 dB indicate
-    a healthy voice; both rise with vocal pathology.
+    a healthy voice; both rise with vocal pathology.  Pass a precomputed
+    ``track`` from :func:`f0_track` to avoid recomputing pitch.
     """
-    epochs, peaks = _find_epochs(samples, sr, fmin, fmax)
+    epochs, peaks = _find_epochs(samples, sr, fmin, fmax, track=track)
     if len(epochs) < 3:
         return JitterShimmer(jitter_local_percent=float("nan"),
                              shimmer_local_db=float("nan"), n_periods=0)
@@ -354,14 +358,18 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
 
 
 def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
-        frame_length: int | None = None, hop_length: int | None = None) -> float:
+        frame_length: int | None = None, hop_length: int | None = None,
+        track: F0Track | None = None) -> float:
     """Harmonics-to-noise ratio in dB, estimated from autocorrelation.
 
     Uses the relation HNR ≈ 10·log10(r/(1−r)) at the best F0 lag, averaged
     over voiced frames.  Values above ~20 dB indicate a tonal, stable voice.
+    Pass a precomputed ``track`` from :func:`f0_track` to avoid recomputing
+    pitch.
     """
-    track = f0_track(samples, sr, fmin=fmin, fmax=fmax,
-                     frame_length=frame_length, hop_length=hop_length)
+    if track is None:
+        track = f0_track(samples, sr, fmin=fmin, fmax=fmax,
+                         frame_length=frame_length, hop_length=hop_length)
     if not np.any(track.voiced):
         return float("nan")
 
@@ -396,8 +404,10 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
 def analyze(audio: AudioData) -> dict:
     """Run a standard acoustic analysis and return a JSON-ready dict."""
     sr, x = audio.sample_rate, audio.samples
+    # pitch is the most expensive stage — compute once and share it with
+    # the jitter/shimmer and HNR estimators
     track = f0_track(x, sr)
-    js = jitter_shimmer(x, sr)
+    js = jitter_shimmer(x, sr, track=track)
     fl, hl = default_frame_lengths(sr)
     # median formants over the most energetic voiced frames
     frames = frame_signal(x, fl, hl, window="rect", center=True)
@@ -422,6 +432,6 @@ def analyze(audio: AudioData) -> dict:
         "n_samples": int(audio.num_samples),
         "pitch": track.summary(),
         "voice_quality": js.summary(),
-        "hnr_db": round(hnr(x, sr), 2) if len(x) else float("nan"),
+        "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
         "formants": formant_summary,
     }

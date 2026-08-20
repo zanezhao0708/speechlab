@@ -97,3 +97,43 @@ def test_analyze_end_to_end(tmp_path):
     assert report["pitch"]["f0_median_hz"] == pytest.approx(140.0, rel=0.05)
     assert report["voice_quality"]["n_periods"] > 30
     assert set(report["formants"]) == {"F1_hz", "F2_hz", "F3_hz"}
+
+
+def test_analyze_computes_f0_once(monkeypatch, tmp_path):
+    """The F0 track is shared with jitter/shimmer and HNR, not recomputed."""
+    import speechlab.features as feats
+
+    calls = {"n": 0}
+    real = feats.f0_track
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(feats, "f0_track", counting)
+    sr = 16000
+    x = vowel_like(f0_hz=140.0, duration_s=0.8, sr=sr)
+    path = write_wav(str(tmp_path / "utt.wav"), x, sr)
+    report = feats.analyze(load_audio(path))
+    assert calls["n"] == 1
+    # results are unchanged by the sharing
+    assert report["pitch"]["f0_median_hz"] == pytest.approx(140.0, rel=0.05)
+    assert report["voice_quality"]["n_periods"] > 30
+
+
+def test_jitter_shimmer_accepts_precomputed_track():
+    sr = 16000
+    x = vowel_like(f0_hz=150.0, duration_s=0.6, sr=sr)
+    track = f0_track(x, sr)
+    with_track = jitter_shimmer(x, sr, track=track)
+    without = jitter_shimmer(x, sr)
+    assert with_track.n_periods == without.n_periods
+    assert with_track.jitter_local_percent == pytest.approx(
+        without.jitter_local_percent)
+
+
+def test_hnr_accepts_precomputed_track():
+    sr = 16000
+    x = tone(200.0, 1.0, sr=sr, amp=0.5)
+    track = f0_track(x, sr)
+    assert hnr(x, sr, track=track) == pytest.approx(hnr(x, sr))
