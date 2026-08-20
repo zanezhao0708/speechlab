@@ -12,12 +12,15 @@ analysis directly without any API key.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import re
 import shutil
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -49,6 +52,35 @@ class Session:
 _SESSIONS: dict[str, Session] = {}
 _LOCK = threading.Lock()
 
+# LRU cache of finished analyses keyed by (size, mtime_ns) so re-analysing
+# the same file (chat tool call after a direct report, repeated questions)
+# is instant.
+_ANALYSIS_CACHE: OrderedDict = OrderedDict()
+_CACHE_MAX = 64
+
+
+def _cached_analyze(path: str, contour: bool) -> dict:
+    """Analyse with an LRU cache; always caches the full (contour) report."""
+    with open(path, "rb") as fh:
+        key = hashlib.md5(fh.read()).hexdigest()
+    with _LOCK:
+        hit = _ANALYSIS_CACHE.get(key)
+        if hit is not None:
+            _ANALYSIS_CACHE.move_to_end(key)
+            full = hit
+        else:
+            full = None
+    if full is None:
+        full = analyze(load_audio(path), contour=True)
+        with _LOCK:
+            _ANALYSIS_CACHE[key] = full
+            while len(_ANALYSIS_CACHE) > _CACHE_MAX:
+                _ANALYSIS_CACHE.popitem(last=False)
+    if not contour:
+        full = {k: v for k, v in full.items()
+                if k not in ("pitch_contour", "spectrogram")}
+    return full
+
 
 def _get_session(session_id: str | None) -> tuple[str, Session]:
     with _LOCK:
@@ -69,7 +101,7 @@ def _json_safe(obj):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_json_safe(v) for v in obj]
-    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
+    if isinstance(obj, float) and (math.isnan(obj) or obj in (float("inf"), float("-inf"))):
         return None
     return obj
 
@@ -85,7 +117,7 @@ def _make_tools(upload_dir: str) -> dict:
             raise FileNotFoundError(
                 f"'{raw}' is not an uploaded file; available files: {', '.join(available)}"
             )
-        return analyze(load_audio(path))
+        return _cached_analyze(path, contour=False)
 
     return {"analyze_audio": analyze_audio}
 
@@ -191,11 +223,12 @@ def analyze_direct():
         path = os.path.join(tmpdir, safe)
         f.save(path)
         try:
-            report = analyze(load_audio(path), contour=True)
+            report = _cached_analyze(path, contour=True)
         except Exception as exc:  # noqa: BLE001 — report file/decoding problems
             return jsonify(error=f"分析失败：{exc}"), 400
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    report = dict(report)  # copy: cached dict is shared
     report["file"] = f.filename
     return jsonify(_json_safe(report))
 

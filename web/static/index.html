@@ -610,14 +610,16 @@ async function analyzeFiles(files, fromRecord) {
   addMessage("user", `${fromRecord ? "🎤" : "📊"} 直接声学分析：${files.map(f => f.name).join("、")}`);
   addTyping();
   try {
-    const reports = [];
-    for (const file of files) {
+    const results = await Promise.all(files.map(async (file) => {
       const fd = new FormData();
       fd.append("file", file);
       const r = await fetch("/api/analyze", { method: "POST", body: fd });
-      const d = await r.json();
-      if (!r.ok) { addMessage("error", `${file.name}：${d.error || "分析失败"}`); continue; }
-      reports.push(d);
+      return { file, d: await r.json(), ok: r.ok };
+    }));
+    const reports = [];
+    for (const { file, d, ok } of results) {
+      if (!ok) addMessage("error", `${file.name}：${d.error || "分析失败"}`);
+      else reports.push(d);
     }
     removeTyping();
     if (reports.length === 1) {

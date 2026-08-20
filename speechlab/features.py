@@ -34,9 +34,9 @@ __all__ = [
     "hnr",
     "jitter_shimmer",
     "lpc",
+    "pause_stats",
     "recording_quality",
     "spectrogram",
-    "pause_stats",
     "voiced_segments",
 ]
 
@@ -566,11 +566,11 @@ def pause_stats(samples: np.ndarray, sr: int, min_pause_s: float = 0.2,
 
     # syllable nuclei: peaks of the low-passed speech-region energy envelope
     env = 10 ** (rms_db / 20)
-    win = max(3, int(round(0.05 / t_frame)) | 1)  # ~50 ms smoothing
+    win = max(3, round(0.05 / t_frame) | 1)  # ~50 ms smoothing
     kernel = np.hanning(win)
     kernel /= kernel.sum() if kernel.sum() > 0 else 1.0
     env_s = np.convolve(env, kernel, mode="same")
-    min_dist = max(1, int(round(0.12 / t_frame)))  # ≥120 ms between nuclei
+    min_dist = max(1, round(0.12 / t_frame))  # ≥120 ms between nuclei
     thr = 0.25 * float(np.max(env_s))
     n_syll = 0
     i = 1
