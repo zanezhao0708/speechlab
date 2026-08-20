@@ -1,5 +1,7 @@
 """Tests for audio I/O and utilities."""
 
+import wave
+
 import numpy as np
 import pytest
 
@@ -42,6 +44,21 @@ def test_resample_changes_length():
 def test_load_missing_file():
     with pytest.raises(FileNotFoundError):
         load_audio("/nonexistent/file.wav")
+
+
+def test_load_8bit_wav_is_unsigned(tmp_path):
+    """8-bit WAV is unsigned per the RIFF spec: 128 = silence."""
+    path = str(tmp_path / "u8.wav")
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(1)
+        wf.setframerate(8000)
+        wf.writeframes(bytes([128, 255, 0, 128]))  # silence, +peak, -peak, silence
+    audio = load_audio(path)
+    assert audio.samples[0] == pytest.approx(0.0, abs=1e-9)
+    assert audio.samples[1] == pytest.approx(1.0, abs=0.02)
+    assert audio.samples[2] == pytest.approx(-1.0, abs=0.02)
+    assert audio.samples[3] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_db_floor():

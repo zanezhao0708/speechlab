@@ -60,6 +60,23 @@ def default_frame_lengths(sr: int) -> tuple[int, int]:
     return max(1, round(sr * 0.025)), max(1, round(sr * 0.010))
 
 
+def _json_ready(obj: Any) -> Any:
+    """Replace non-finite floats (NaN/±inf) with ``None`` recursively.
+
+    ``json.dumps`` emits ``NaN``/``Infinity`` literals by default, which are
+    not valid strict JSON and are rejected by many parsers (including some
+    LLM tool pipelines).  Reports are meant to be JSON-ready, so undefined
+    measurements are surfaced as ``null`` instead.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_ready(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
 def _defaults(sr: int, frame_length: int | None, hop_length: int | None):
     if frame_length is None or hop_length is None:
         fl, hl = default_frame_lengths(sr)
@@ -216,14 +233,15 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
         f0[idx] = sr / lag_est[good]
         voiced[idx] = True
 
-    # octave-jump suppression: median filter over voiced frames
+    # octave-jump suppression: median filter over voiced frames.
+    # ndimage's 'nearest' edge mode avoids medfilt's zero-padding, which
+    # would pull the first/last voiced F0 values toward 0.
     if np.any(voiced):
-        from scipy.signal import medfilt
+        from scipy.ndimage import median_filter
 
         v_idx = np.where(voiced)[0]
         if len(v_idx) >= 3:
-            smoothed = medfilt(f0[v_idx], 3)
-            f0[v_idx] = smoothed
+            f0[v_idx] = median_filter(f0[v_idx], size=3, mode="nearest")
 
     return F0Track(times=times, f0=f0, voiced=voiced)
 
@@ -556,6 +574,9 @@ def cpps(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
     active = db(rms ** 2) > energy_floor_db
     if not np.any(active):
         return float("nan")
+    # a smoothing window longer than the signal would make np.convolve
+    # return a longer array than `active`; clamp it for short recordings
+    smoothing_frames = min(smoothing_frames, len(frames))
 
     # real cepstrum: IFFT of the log magnitude spectrum (in dB)
     spec = np.abs(rfft(frames, axis=1))
@@ -793,7 +814,7 @@ def analyze(audio: AudioData) -> dict:
     else:
         formant_summary = {}
 
-    return {
+    return _json_ready({
         "file": audio.path,
         "duration_s": round(audio.duration, 3),
         "sample_rate_hz": sr,
@@ -805,4 +826,4 @@ def analyze(audio: AudioData) -> dict:
         "spectral": spectral_stats(x, sr),
         "activity": activity_summary(x, sr, frames=frames),
         "formants": formant_summary,
-    }
+    })

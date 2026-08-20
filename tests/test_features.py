@@ -162,6 +162,14 @@ def test_cpps_silence_is_nan():
     assert np.isnan(cpps(np.zeros(16000), 16000))
 
 
+def test_cpps_short_signal_no_crash():
+    """Smoothing window longer than the frame count must not raise."""
+    sr = 16000
+    for dur in (0.03, 0.05, 0.08):
+        x = vowel_like(f0_hz=140.0, duration_s=dur, sr=sr)
+        assert np.isfinite(cpps(x, sr))
+
+
 # ------------------------------------------------------------------ spectral
 def test_spectral_stats_vowel_vs_noise():
     sr = 16000
@@ -292,3 +300,27 @@ def test_analyze_includes_new_measures(tmp_path):
     assert report["activity"]["n_pauses"] == 1
     # everything must survive a JSON round-trip (LLM tool payload)
     json.dumps(report)
+
+
+def test_analyze_report_is_strict_json(tmp_path):
+    """Undefined measures become null, never NaN/Infinity literals."""
+    sr = 16000
+    # unvoiced noise -> jitter/shimmer/HNR undefined
+    path = write_wav(str(tmp_path / "noise.wav"), noise(0.5, sr=sr, amp=0.3, seed=1), sr)
+    report = analyze(load_audio(path))
+    # allow_nan=False raises ValueError if any NaN/inf remains
+    json.dumps(report, allow_nan=False)
+    assert report["voice_quality"]["jitter_local_percent"] is None
+    assert report["hnr_db"] is None
+
+
+def test_f0_track_edges_not_pulled_to_zero():
+    """Median smoothing must not drag the first/last voiced F0 toward 0."""
+    sr = 16000
+    x = vowel_like(f0_hz=200.0, duration_s=0.5, sr=sr)
+    track = f0_track(x, sr)
+    v = track.f0[track.voiced]
+    assert len(v) >= 3
+    # edge values stay near the true F0, not collapsed by zero-padding
+    assert v[0] == pytest.approx(200.0, rel=0.15)
+    assert v[-1] == pytest.approx(200.0, rel=0.15)

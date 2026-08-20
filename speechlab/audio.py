@@ -56,8 +56,13 @@ def _wav_to_float(raw: bytes, sampwidth: int, dtype_code: str) -> np.ndarray:
     """Convert raw WAV bytes to float64 in [-1, 1]."""
     if dtype_code == "f":  # 32/64-bit float PCM already in native range
         return np.frombuffer(raw, dtype="<f4" if sampwidth == 4 else "<f8").astype(np.float64)
-    fmt = {1: "b", 2: "h", 3: "i", 4: "i"}[sampwidth]
-    n_bytes = {"b": 1, "h": 2, "i": 4}[fmt]
+    if sampwidth == 1:
+        # 8-bit WAV is *unsigned* per the RIFF spec: 128 is silence, 0 is
+        # -full-scale, 255 is +full-scale.
+        vals = np.frombuffer(raw, dtype=np.uint8).astype(np.float64)
+        return (vals - 128.0) / 128.0
+    fmt = {2: "h", 3: "i", 4: "i"}[sampwidth]
+    n_bytes = {"h": 2, "i": 4}[fmt]
     vals = np.frombuffer(raw, dtype=np.dtype(fmt).newbyteorder("<"))
     peak = float(2 ** (8 * n_bytes - 1))
     return vals.astype(np.float64) / peak
@@ -169,6 +174,7 @@ def frame_signal(
     *,
     window: str = "hann",
     center: bool = True,
+    pad_mode: str = "constant",
 ) -> np.ndarray:
     """Slice a signal into overlapping frames.
 
@@ -176,14 +182,19 @@ def frame_signal(
     framing (``window="rect"``) returns a zero-copy, read-only strided view
     of the (padded) signal, so it costs no time or memory; windowed framing
     multiplies into a fresh contiguous array.
+
+    ``pad_mode`` controls the centred-padding fill.  The default ``constant``
+    (zero) padding is the standard choice for autocorrelation pitch tracking:
+    ``reflect`` padding mirrors the signal at the boundary, and the mirror
+    symmetry of a periodic signal produces a spurious autocorrelation peak at
+    twice the period (an octave-down error) in the edge frames.
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
     x = np.asarray(samples, dtype=np.float64)
     if center:  # pad so that frames are centred on sample indices
         pad = frame_length // 2
-        mode = "reflect" if pad < len(x) else "constant"
-        x = np.pad(x, (pad, pad), mode=mode)
+        x = np.pad(x, (pad, pad), mode=pad_mode)
 
     if len(x) < frame_length:
         return np.empty((0, frame_length), dtype=np.float64)
