@@ -35,6 +35,8 @@ __all__ = [
     "jitter_shimmer",
     "lpc",
     "recording_quality",
+    "spectrogram",
+    "pause_stats",
     "voiced_segments",
 ]
 
@@ -478,6 +480,124 @@ def voiced_segments(track: F0Track, min_len_s: float = 0.3,
 
 
 # --------------------------------------------------------------------------
+# spectrogram & temporal structure (pauses, speech rate)
+# --------------------------------------------------------------------------
+
+def spectrogram(samples: np.ndarray, sr: int, max_time_bins: int = 120,
+                max_freq_bins: int = 80, fmax_hz: float = 5000.0) -> dict:
+    """Compact log-magnitude spectrogram for visualisation.
+
+    Returns a downsampled dB matrix (``values[freq_bin][time_bin]``) plus the
+    axis ranges, small enough to ship as JSON.
+    """
+    x = np.asarray(samples, dtype=np.float64)
+    frame_length, hop_length = default_frame_lengths(sr)
+    frames = frame_signal(x, frame_length, hop_length, window="hann", center=True)
+    if len(frames) == 0:
+        return {"times_s": [], "freqs_hz": [], "values_db": [], "t_max": 0.0}
+
+    spec = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(frame_length, 1.0 / sr)
+    keep = freqs <= fmax_hz
+    spec, freqs = spec[:, keep], freqs[keep]
+    spec_db = db(spec.T)  # (freq_bins, time_bins)
+
+    # block-average to the target resolution
+    def _pool(a: np.ndarray, axis: int, target: int) -> np.ndarray:
+        n = a.shape[axis]
+        if n <= target:
+            return a
+        size = int(np.ceil(n / target))
+        trim = (n // size) * size
+        sl = [slice(None)] * a.ndim
+        sl[axis] = slice(0, trim)
+        a = a[tuple(sl)]
+        return a.reshape(*a.shape[:axis], -1, size, *a.shape[axis + 1:]).mean(axis=axis + 1)
+
+    spec_db = _pool(spec_db, 1, max_time_bins)
+    freqs = _pool(freqs, 0, max_freq_bins)
+
+    times = (np.arange(spec_db.shape[1]) + 0.5) * hop_length / sr
+    return {
+        "t_max": round(float(len(x) / sr), 3),
+        "times_s": [round(float(t), 3) for t in times],
+        "freqs_hz": [round(float(f)) for f in freqs],
+        "values_db": [[round(float(v), 1) for v in row] for row in spec_db],
+    }
+
+
+def pause_stats(samples: np.ndarray, sr: int, min_pause_s: float = 0.2,
+                min_speech_db_rel: float = 32.0) -> dict:
+    """Temporal structure: silence ratio, pauses, and a syllable-rate estimate.
+
+    Pauses are energy-gated silence runs of at least ``min_pause_s``; syllable
+    nuclei are counted as peaks of the smoothed energy envelope (de Jong &
+    Wempe 2009 style) — a useful rough articulation-rate estimate for
+    connected speech, not a substitute for forced alignment.
+    """
+    x = np.asarray(samples, dtype=np.float64)
+    if len(x) < sr // 4:
+        return {}
+
+    frame_length, hop_length = default_frame_lengths(sr)
+    frames = frame_signal(x, frame_length, hop_length, window="rect", center=True)
+    rms_db = db(np.mean(frames ** 2, axis=1) + 1e-12)
+    t_frame = hop_length / sr
+
+    peak_db = float(np.max(rms_db))
+    speech_thr = peak_db - min_speech_db_rel
+    is_speech = rms_db > speech_thr
+    n_frames = len(rms_db)
+
+    # silence runs >= min_pause_s sandwiched by speech
+    pauses: list[float] = []
+    run = 0
+    seen_speech = False
+    for v in is_speech:
+        if not v:
+            run += 1
+            continue
+        if seen_speech and run * t_frame >= min_pause_s:
+            pauses.append(round(run * t_frame, 3))
+        seen_speech = True
+        run = 0
+    speech_frames = int(np.sum(is_speech))
+    speech_s = speech_frames * t_frame
+
+    # syllable nuclei: peaks of the low-passed speech-region energy envelope
+    env = 10 ** (rms_db / 20)
+    win = max(3, int(round(0.05 / t_frame)) | 1)  # ~50 ms smoothing
+    kernel = np.hanning(win)
+    kernel /= kernel.sum() if kernel.sum() > 0 else 1.0
+    env_s = np.convolve(env, kernel, mode="same")
+    min_dist = max(1, int(round(0.12 / t_frame)))  # ≥120 ms between nuclei
+    thr = 0.25 * float(np.max(env_s))
+    n_syll = 0
+    i = 1
+    last_peak = -10**9
+    while i < n_frames - 1:
+        if (is_speech[i] and env_s[i] > thr
+                and env_s[i] >= env_s[i - 1] and env_s[i] > env_s[i + 1]
+                and i - last_peak >= min_dist):
+            n_syll += 1
+            last_peak = i
+            i += min_dist
+            continue
+        i += 1
+
+    return {
+        "speech_s": round(speech_s, 2),
+        "silence_ratio": round(1.0 - speech_frames / n_frames, 3),
+        "n_pauses": len(pauses),
+        "pause_total_s": round(float(np.sum(pauses)), 2),
+        "pause_mean_s": round(float(np.mean(pauses)), 3) if pauses else 0.0,
+        "pause_max_s": round(float(np.max(pauses)), 3) if pauses else 0.0,
+        "syllable_est": int(n_syll),
+        "articulation_rate_syl_per_s": round(n_syll / speech_s, 2) if speech_s > 0.2 else None,
+    }
+
+
+# --------------------------------------------------------------------------
 # the agent's tool entry point
 # --------------------------------------------------------------------------
 
@@ -520,6 +640,7 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
         "formants": formant_summary,
         "recording_quality": recording_quality(x, sr),
         "voiced_segments": voiced_segments(track),
+        "pause_stats": pause_stats(x, sr),
     }
     if contour:
         step = max(1, len(track.times) // 400)  # keep payloads small
@@ -529,4 +650,5 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
             "f0_hz": [round(float(f), 1) if v else None
                       for f, v in zip(track.f0[idx], track.voiced[idx])],
         }
+        report["spectrogram"] = spectrogram(x, sr)
     return report
