@@ -54,6 +54,28 @@ def _defaults(sr: int, frame_length: int | None, hop_length: int | None):
     return frame_length, hop_length
 
 
+def _batch_autocorr(fx: np.ndarray, lags: np.ndarray | None = None,
+                    chunk: int = 2048) -> np.ndarray:
+    """Autocorrelation of every row of ``fx``, computed in batches via FFT.
+
+    Returns ``out`` with ``out[i, k] = sum_t fx[i, t] * fx[i, t + k]`` for
+    every requested lag ``k`` in ``lags`` (all lags ``0 .. n-1`` when
+    ``lags`` is None).  This is O(n log n) per frame instead of the O(n *
+    n_lags) direct product, and batches frames so long signals stay fast.
+    """
+    from scipy.fft import irfft, next_fast_len, rfft
+
+    m, n = fx.shape
+    nfft = next_fast_len(2 * n)  # zero-padded -> linear (non-circular) corr
+    cols = np.arange(n) if lags is None else np.asarray(lags, dtype=np.intp)
+    out = np.empty((m, len(cols)), dtype=np.float64)
+    for s in range(0, m, chunk):
+        F = rfft(fx[s : s + chunk], n=nfft, axis=1)
+        power = F.real ** 2 + F.imag ** 2
+        out[s : s + chunk] = irfft(power, n=nfft, axis=1)[:, cols]
+    return out
+
+
 # --------------------------------------------------------------------------
 # pitch
 # --------------------------------------------------------------------------
@@ -97,7 +119,8 @@ class F0Track:
 def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
              frame_length: int | None = None, hop_length: int | None = None,
              voicing_threshold: float = 0.35,
-             energy_floor_db: float = -55.0) -> F0Track:
+             energy_floor_db: float = -55.0,
+             frames: np.ndarray | None = None) -> F0Track:
     """Autocorrelation-based F0 tracker.
 
     Parameters
@@ -105,6 +128,9 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
     fmin, fmax : pitch search range in Hz (60–500 covers adult speech).
     voicing_threshold : minimum normalised autocorrelation for a voiced frame.
     energy_floor_db : frames below this RMS dB are never voiced.
+    frames : optional precomputed framing from
+        ``frame_signal(samples, frame_length, hop_length, window="rect",
+        center=True)``; lets callers that frame the signal anyway reuse it.
     """
     frame_length, hop_length = _defaults(sr, frame_length, hop_length)
     lag_min = max(2, int(np.floor(sr / fmax)))
@@ -114,7 +140,9 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
     if lag_min >= lag_max:
         raise ValueError("pitch search range does not fit the analysis frame")
 
-    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=True)
+    if frames is None:
+        frames = frame_signal(samples, frame_length, hop_length,
+                              window="rect", center=True)
     n_frames = len(frames)
     times = (np.arange(n_frames) * hop_length + frame_length / 2 - frame_length // 2) / sr
 
@@ -138,37 +166,41 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
         return F0Track(times=times, f0=f0, voiced=voiced)
 
     act_idx = np.where(active)[0]
-    fx = frames[act_idx] - frames[act_idx].mean(axis=1, keepdims=True)
+    fx = frames[act_idx]
+    fx = fx - fx.mean(axis=1, keepdims=True)
     # cumulative energies for O(1) segment-energy lookups
     cum = np.concatenate([np.zeros((n_active, 1)), np.cumsum(fx ** 2, axis=1)], axis=1)
 
-    ac = np.empty((n_active, len(lags)), dtype=np.float64)
-    for j, lag in enumerate(lags):
-        num = np.einsum("ij,ij->i", fx[:, : frame_length - lag], fx[:, lag:])
-        e1 = cum[:, frame_length - lag]                       # energy of x[:N-lag]
-        e2 = cum[:, frame_length] - cum[:, lag]                # energy of x[lag:]
-        ac[:, j] = num / np.sqrt(np.maximum(e1 * e2, 1e-20))
+    num = _batch_autocorr(fx, lags)
+    e1 = cum[:, frame_length - lags]              # energy of x[:N-lag]
+    e2 = cum[:, frame_length, None] - cum[:, lags]  # energy of x[lag:]
+    ac = num / np.sqrt(np.maximum(e1 * e2, 1e-20))
 
-    for i, fi in enumerate(act_idx):
-        a = ac[i]
-        r_max = float(a.max())
-        if r_max < voicing_threshold:
-            continue
+    r_max = ac.max(axis=1)
+    ok = r_max >= voicing_threshold
+    if np.any(ok):
         # Autocorrelation of a periodic signal peaks at every integer
         # multiple of the period.  Choosing the *shortest* lag within a
         # tolerance of the maximum avoids subharmonic (octave-down) errors.
-        thr = 0.85 * r_max
-        j = int(np.argmax(a >= thr))
+        a = ac[ok]
+        thr = 0.85 * r_max[ok]
+        j = np.argmax(a >= thr[:, None], axis=1)  # first lag within tolerance
+        n_lags = len(lags)
+        rows = np.arange(len(a))
+        y1 = a[rows, j]
+        y0 = a[rows, np.maximum(j - 1, 0)]
+        y2 = a[rows, np.minimum(j + 1, n_lags - 1)]
         # parabolic interpolation around the peak
-        lag_est = float(lags[j])
-        if 0 < j < len(a) - 1:
-            y0, y1, y2 = a[j - 1], a[j], a[j + 1]
-            denom_p = y0 - 2 * y1 + y2
-            if abs(denom_p) > 1e-9:
-                lag_est = lags[j] + 0.5 * (y0 - y2) / denom_p
-        if lag_est > 0:
-            f0[fi] = sr / lag_est
-            voiced[fi] = True
+        denom = y0 - 2.0 * y1 + y2
+        lag_est = lags[j].astype(np.float64)
+        interp = (j > 0) & (j < n_lags - 1) & (np.abs(denom) > 1e-9)
+        shift = np.zeros(len(a))
+        np.divide(0.5 * (y0 - y2), denom, out=shift, where=interp)
+        lag_est += shift
+        good = lag_est > 0
+        idx = act_idx[ok][good]
+        f0[idx] = sr / lag_est[good]
+        voiced[idx] = True
 
     # octave-jump suppression: median filter over voiced frames
     if np.any(voiced):
@@ -197,7 +229,12 @@ def lpc(samples: np.ndarray, order: int) -> np.ndarray:
     x = x - x.mean()
     if len(x) <= order:
         raise ValueError("frame too short for the requested LPC order")
-    r = np.correlate(x, x, mode="full")[len(x) - 1 : len(x) - 1 + order + 1]
+    # autocorrelation for lags 0..order only: O(N*order) instead of the
+    # O(N^2) full np.correlate, which computes every lag and discards most
+    r = np.empty(order + 1)
+    r[0] = np.dot(x, x)
+    for k in range(1, order + 1):
+        r[k] = np.dot(x[:-k], x[k:])
     if np.allclose(r[0], 0.0):
         return np.zeros(order)
     a = solve_toeplitz(r[:order], r[1 : order + 1])
@@ -218,6 +255,70 @@ def _auto_pre_emphasis(sr: int) -> float:
     return c - np.sqrt(disc)
 
 
+def _batch_formants(frames: np.ndarray, sr: int, order: int | None = None,
+                    pre_emphasis: float | None = None,
+                    max_formants: int = 4) -> list[list[float]]:
+    """Formant frequencies for a stack of frames; batched :func:`formants`.
+
+    Identical pre-emphasis, LPC order and root filtering as
+    :func:`formants`, but the Yule-Walker systems of all frames are solved
+    together with a vectorised Levinson-Durbin recursion — the per-frame
+    scipy/numpy call overhead otherwise dominates on long recordings.
+    """
+    x = np.asarray(frames, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError("expected a 2-D array of analysis frames")
+    m, n = x.shape
+    if order is None:
+        order = min(16, int(2 + sr / 1000.0))
+    if pre_emphasis is None:
+        pre_emphasis = _auto_pre_emphasis(sr)
+    if n <= order:
+        raise ValueError("frame too short for the requested LPC order")
+
+    if pre_emphasis:
+        xp = np.empty_like(x)
+        xp[:, 0] = x[:, 0]
+        xp[:, 1:] = x[:, 1:] - pre_emphasis * x[:, :-1]
+        x = xp
+    x = x - x.mean(axis=1, keepdims=True)
+
+    # per-frame autocorrelation for lags 0..order
+    r = np.empty((m, order + 1))
+    r[:, 0] = np.einsum("ij,ij->i", x, x)
+    for k in range(1, order + 1):
+        r[:, k] = np.einsum("ij,ij->i", x[:, :-k], x[:, k:])
+
+    out: list[list[float]] = [[] for _ in range(m)]
+    idx = np.where(np.abs(r[:, 0]) > 1e-8)[0]  # silent frames have no LPC
+    if len(idx) == 0:
+        return out
+    rr = r[idx]
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        # vectorised Levinson-Durbin over all kept frames
+        a = np.zeros((len(idx), order))
+        E = rr[:, 0].copy()
+        for k in range(1, order + 1):
+            acc = np.zeros(len(idx))
+            if k > 1:
+                acc = np.einsum("ij,ij->i", a[:, : k - 1], rr[:, k - 1 : 0 : -1])
+            rc = (rr[:, k] - acc) / E
+            a[:, k - 1] = rc
+            if k > 1:
+                a[:, : k - 1] -= rc[:, None] * a[:, k - 2 :: -1]
+            E = E * (1.0 - rc * rc)
+
+    nyq_edge = sr / 2.0 - 50.0
+    for row, i in enumerate(idx):
+        roots = np.roots(np.concatenate(([1.0], a[row])))
+        freqs = np.angle(roots) * sr / (2.0 * np.pi)
+        band = ((np.abs(roots.imag) > 1e-10)
+                & (freqs > 90.0) & (freqs < nyq_edge))  # skip DC/Nyquist roots
+        sel = np.sort(freqs[band])
+        out[i] = [float(f) for f in sel[:max_formants]]
+    return out
+
+
 def formants(samples: np.ndarray, sr: int, order: int | None = None,
              pre_emphasis: float | None = None,
              max_formants: int = 4) -> list[float]:
@@ -229,27 +330,10 @@ def formants(samples: np.ndarray, sr: int, order: int | None = None,
     pre_emphasis : coefficient; ``None`` derives one from the sample rate
         (50 Hz corner).  Pass ``0.0`` to disable.
     """
-    if order is None:
-        order = min(16, int(2 + sr / 1000.0))
-    if pre_emphasis is None:
-        pre_emphasis = _auto_pre_emphasis(sr)
     x = np.asarray(samples, dtype=np.float64)
-    if pre_emphasis:
-        x = np.append(x[0], x[1:] - pre_emphasis * x[:-1])
-    a = lpc(x, order)
-    poly = np.concatenate(([1.0], a))
-    roots = np.roots(poly)
-
-    freqs = []
-    for r in roots:
-        if abs(r.imag) <= 1e-10:
-            continue
-        freq = np.angle(r) * sr / (2 * np.pi)
-        if 90.0 < freq < sr / 2.0 - 50.0:  # skip DC/Nyquist-adjacent roots
-            freqs.append((freq, abs(r)))
-    freqs.sort()
-    out = [float(f) for f, _ in freqs[:max_formants]]
-    return out
+    return _batch_formants(x[None, :], sr, order=order,
+                           pre_emphasis=pre_emphasis,
+                           max_formants=max_formants)[0]
 
 
 # --------------------------------------------------------------------------
@@ -304,32 +388,38 @@ def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
         win_len += 1
     kernel = np.hanning(win_len)
     kernel = kernel / kernel.sum() if kernel.sum() > 0 else kernel
-    xs = np.convolve(x, kernel, mode="same")
+    from scipy.signal import oaconvolve
+
+    xs = oaconvolve(x, kernel, mode="same")
 
     min_dist = max(2, round(0.6 * period))
     threshold = 0.1 * np.max(np.abs(xs))
-    epochs: list[int] = []
-    i = 1
-    n = len(xs)
-    while i < n - 1:
-        is_peak = xs[i] > threshold and xs[i] >= xs[i - 1] and xs[i] > xs[i + 1]
-        if is_peak and (not epochs or i - epochs[-1] >= min_dist):
-            epochs.append(i)
-            i += min_dist
-            continue
-        i += 1
+    # vectorised peak picking: strict local maxima above the threshold...
+    inner = xs[1:-1]
+    cand = np.where(
+        (inner > threshold) & (inner >= xs[:-2]) & (inner > xs[2:])
+    )[0] + 1
+    # ...then accepted greedily left-to-right with the minimum spacing
+    # (candidates are ~one per period, so this loop is tiny)
+    epochs_arr = np.empty(len(cand), dtype=np.int64)
+    n_kept = 0
+    last = -(1 << 62)
+    for c in cand:
+        if c - last >= min_dist:
+            epochs_arr[n_kept] = c
+            n_kept += 1
+            last = c
+    epochs_arr = epochs_arr[:n_kept]
 
-    epochs_arr = np.asarray(epochs, dtype=int)
     if len(epochs_arr) >= 2:
         # drop periods outside the plausible F0 range
         periods = np.diff(epochs_arr) / sr
         good = (periods >= 1.0 / fmax) & (periods <= 1.0 / fmin)
         if not np.all(good):
-            keep = [epochs_arr[0]]
-            for k in range(1, len(epochs_arr)):
-                if good[k - 1]:
-                    keep.append(epochs_arr[k])
-            epochs_arr = np.asarray(keep, dtype=int)
+            keep = np.empty(len(epochs_arr), dtype=bool)
+            keep[0] = True
+            keep[1:] = good
+            epochs_arr = epochs_arr[keep]
     return epochs_arr, x[epochs_arr] if len(epochs_arr) else np.empty(0)
 
 
@@ -359,42 +449,49 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
 
 def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
         frame_length: int | None = None, hop_length: int | None = None,
-        track: F0Track | None = None) -> float:
+        track: F0Track | None = None,
+        frames: np.ndarray | None = None) -> float:
     """Harmonics-to-noise ratio in dB, estimated from autocorrelation.
 
     Uses the relation HNR ≈ 10·log10(r/(1−r)) at the best F0 lag, averaged
     over voiced frames.  Values above ~20 dB indicate a tonal, stable voice.
-    Pass a precomputed ``track`` from :func:`f0_track` to avoid recomputing
-    pitch.
+    Pass a precomputed ``track`` from :func:`f0_track` (and optionally the
+    matching ``frames``) to avoid recomputing pitch and framing.
     """
     if track is None:
         track = f0_track(samples, sr, fmin=fmin, fmax=fmax,
-                         frame_length=frame_length, hop_length=hop_length)
+                         frame_length=frame_length, hop_length=hop_length,
+                         frames=frames)
     if not np.any(track.voiced):
         return float("nan")
 
     frame_length, hop_length = _defaults(sr, frame_length, hop_length)
-    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=True)
-    vals = []
-    for i in np.where(track.voiced)[0]:
-        if i >= len(frames):
-            continue
-        fx = frames[i]
-        fx = fx - fx.mean()
-        d2 = np.sum(fx ** 2)
-        if d2 < 1e-10:
-            continue
-        lag = round(sr / max(track.f0[i], 1e-6))
-        if lag <= 0 or lag >= frame_length:
-            continue
-        num = float(np.sum(fx[:-lag] * fx[lag:]))
-        # NCCF-style normalisation over the overlapping segments
-        e1 = float(np.sum(fx[:-lag] ** 2))
-        e2 = float(np.sum(fx[lag:] ** 2))
-        r_val = num / max(np.sqrt(e1 * e2), 1e-20)
-        r_val = min(max(r_val, 1e-6), 0.999999)
-        vals.append(10.0 * np.log10(r_val / (1.0 - r_val)))
-    return float(np.mean(vals)) if vals else float("nan")
+    if frames is None:
+        frames = frame_signal(samples, frame_length, hop_length,
+                              window="rect", center=True)
+    vi = np.where(track.voiced)[0]
+    vi = vi[vi < len(frames)]
+    if len(vi) == 0:
+        return float("nan")
+
+    fx = np.asarray(frames[vi], dtype=np.float64)
+    fx = fx - fx.mean(axis=1, keepdims=True)
+    m = len(fx)
+    lag = np.rint(sr / np.maximum(track.f0[vi], 1e-6)).astype(np.intp)
+    cum = np.concatenate([np.zeros((m, 1)), np.cumsum(fx ** 2, axis=1)], axis=1)
+    ok = (cum[:, frame_length] >= 1e-10) & (lag > 0) & (lag < frame_length)
+    if not np.any(ok):
+        return float("nan")
+    fx, lag = fx[ok], lag[ok]
+    num = _batch_autocorr(fx)
+    num = num[np.arange(len(fx)), lag]
+    # NCCF-style normalisation over the overlapping segments
+    e1 = cum[ok, frame_length - lag]
+    e2 = cum[ok, frame_length] - cum[ok, lag]
+    r_val = num / np.maximum(np.sqrt(e1 * e2), 1e-20)
+    r_val = np.clip(r_val, 1e-6, 0.999999)
+    vals = 10.0 * np.log10(r_val / (1.0 - r_val))
+    return float(np.mean(vals))
 
 
 # --------------------------------------------------------------------------
@@ -404,16 +501,17 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
 def analyze(audio: AudioData) -> dict:
     """Run a standard acoustic analysis and return a JSON-ready dict."""
     sr, x = audio.sample_rate, audio.samples
-    # pitch is the most expensive stage — compute once and share it with
-    # the jitter/shimmer and HNR estimators
-    track = f0_track(x, sr)
-    js = jitter_shimmer(x, sr, track=track)
     fl, hl = default_frame_lengths(sr)
-    # median formants over the most energetic voiced frames
+    # one shared rectangular framing (a zero-copy view) for pitch, formants
+    # and HNR; pitch is the most expensive stage, so compute the track once
+    # and share it with the jitter/shimmer and HNR estimators too
     frames = frame_signal(x, fl, hl, window="rect", center=True)
+    track = f0_track(x, sr, frames=frames)
+    js = jitter_shimmer(x, sr, track=track)
+    # median formants over the most energetic voiced frames
     energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12) if len(frames) else np.empty(0)
     top = np.argsort(energy)[-max(5, len(energy) // 10):] if len(energy) else []
-    formant_rows = [formants(frames[i], sr) for i in top]
+    formant_rows = _batch_formants(frames[top], sr)
     formant_rows = [r for r in formant_rows if len(r) >= 3]
     if formant_rows:
         f_stack = np.vstack([r[:3] for r in formant_rows])
@@ -432,6 +530,6 @@ def analyze(audio: AudioData) -> dict:
         "n_samples": int(audio.num_samples),
         "pitch": track.summary(),
         "voice_quality": js.summary(),
-        "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
+        "hnr_db": round(hnr(x, sr, track=track, frames=frames), 2) if len(x) else float("nan"),
         "formants": formant_summary,
     }

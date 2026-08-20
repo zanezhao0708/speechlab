@@ -111,15 +111,13 @@ def load_audio(path: str, target_sr: int | None = None) -> AudioData:
                 raise ValueError("compressed WAV is not supported")
         if sampwidth == 3:  # 24-bit PCM needs manual unpacking
             n = len(raw) // 3
-            ints = np.empty(n, dtype=np.int32)
-            for i in range(n):
-                b = raw[i * 3 : i * 3 + 3]
-                # little-endian 24-bit signed
-                val = b[0] | (b[1] << 8) | (b[2] << 16)
-                if val & 0x800000:
-                    val -= 0x1000000
-                ints[i] = val
-            samples = ints.astype(np.float64) / 8388608.0
+            b = np.frombuffer(raw, dtype=np.uint8, count=n * 3).reshape(n, 3)
+            vals = (b[:, 0].astype(np.int32)
+                    | (b[:, 1].astype(np.int32) << 8)
+                    | (b[:, 2].astype(np.int32) << 16))
+            # little-endian 24-bit signed: sign-extend the top bit
+            vals = np.where(vals & 0x800000, vals - 0x1000000, vals)
+            samples = vals.astype(np.float64) / 8388608.0
         else:
             samples = _wav_to_float(raw, sampwidth, wf_dtype(sampwidth))
         if n_channels > 1:
@@ -174,8 +172,13 @@ def frame_signal(
 ) -> np.ndarray:
     """Slice a signal into overlapping frames.
 
-    Returns an array of shape ``(n_frames, frame_length)``.
+    Returns an array of shape ``(n_frames, frame_length)``.  Rectangular
+    framing (``window="rect"``) returns a zero-copy, read-only strided view
+    of the (padded) signal, so it costs no time or memory; windowed framing
+    multiplies into a fresh contiguous array.
     """
+    from numpy.lib.stride_tricks import sliding_window_view
+
     x = np.asarray(samples, dtype=np.float64)
     if center:  # pad so that frames are centred on sample indices
         pad = frame_length // 2
@@ -185,16 +188,15 @@ def frame_signal(
     if len(x) < frame_length:
         return np.empty((0, frame_length), dtype=np.float64)
 
-    n_frames = 1 + (len(x) - frame_length) // hop_length
-    idx = np.arange(frame_length)[None, :] + hop_length * np.arange(n_frames)[:, None]
-    frames = x[idx]
+    frames = sliding_window_view(x, frame_length)[::hop_length]
 
+    if window in (None, "rect", "rectangular"):
+        frames.flags.writeable = False
+        return frames
     if window == "hann":
         w = np.hanning(frame_length)
     elif window == "hamming":
         w = np.hamming(frame_length)
-    elif window in (None, "rect", "rectangular"):
-        w = np.ones(frame_length)
     else:
         raise ValueError(f"unknown window: {window}")
     return frames * w
