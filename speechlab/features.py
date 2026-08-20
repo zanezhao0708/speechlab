@@ -1,0 +1,551 @@
+"""Acoustic feature extraction for speech research.
+
+All analysers follow the same conventions:
+
+* signals are mono float64 arrays (see :mod:`speechlab.audio`);
+* frames are 25 ms long with a 10 ms hop by default;
+* every function returns plain floats / numpy arrays so results can be
+  JSON-serialised easily for downstream statistics or LLM consumption.
+
+Features
+--------
+- ``mel_spectrogram`` / ``mfcc`` : spectral features,
+- ``frame_energy`` : short-time RMS energy in dB,
+- ``f0_track`` : autocorrelation pitch tracker with parabolic refinement,
+- ``lpc`` / ``formants`` : linear prediction and formant estimation,
+- ``jitter_shimmer`` : voice-quality perturbation measures,
+- ``hnr`` : harmonics-to-noise ratio estimate.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.fft import dct, rfft
+
+from .audio import AudioData, db, frame_signal
+
+__all__ = [
+    "F0Track",
+    "JitterShimmer",
+    "f0_track",
+    "formants",
+    "frame_energy",
+    "hnr",
+    "hz_to_mel",
+    "jitter_shimmer",
+    "lpc",
+    "mel_filterbank",
+    "mel_spectrogram",
+    "mel_to_hz",
+    "mfcc",
+    "stft_magnitude",
+]
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def default_frame_lengths(sr: int) -> tuple[int, int]:
+    """Return (frame_length, hop_length) for 25 ms / 10 ms at ``sr``."""
+    return max(1, round(sr * 0.025)), max(1, round(sr * 0.010))
+
+
+def hz_to_mel(f: np.ndarray | float) -> np.ndarray | float:
+    """Slaney-style mel scale (matches librosa's default)."""
+    f_min, f_sp = 0.0, 200.0 / 3.0
+    mels = (np.asarray(f, dtype=np.float64) - f_min) / f_sp
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+    if np.isscalar(f):
+        if f > min_log_hz:
+            return min_log_mel + np.log(f / min_log_hz) / logstep
+        return float(mels)
+    log_t = f > min_log_hz
+    mels[log_t] = min_log_mel + np.log(f[log_t] / min_log_hz) / logstep
+    return mels
+
+
+def mel_to_hz(m: np.ndarray | float) -> np.ndarray | float:
+    """Inverse of :func:`hz_to_mel`."""
+    f_min, f_sp = 0.0, 200.0 / 3.0
+    freqs = np.asarray(m, dtype=np.float64) * f_sp + f_min
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+    if np.isscalar(m):
+        if m > min_log_mel:
+            return min_log_hz * np.exp(logstep * (m - min_log_mel))
+        return float(freqs)
+    log_t = m > min_log_mel
+    freqs[log_t] = min_log_hz * np.exp(logstep * (m[log_t] - min_log_mel))
+    return freqs
+
+
+def mel_filterbank(sr: int, n_fft: int, n_mels: int = 26, fmin: float = 0.0,
+                   fmax: float | None = None) -> np.ndarray:
+    """Triangular mel filterbank of shape ``(n_mels, n_fft//2+1)``."""
+    if fmax is None:
+        fmax = sr / 2.0
+    mel_pts = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2)
+    hz_pts = mel_to_hz(mel_pts)
+    bins = np.floor((n_fft + 1) * hz_pts / sr).astype(int)
+    fbank = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
+    for i in range(n_mels):
+        left, center, right = bins[i], bins[i + 1], bins[i + 2]
+        for k in range(left, center):
+            if center != left:
+                fbank[i, k] = (k - left) / (center - left)
+        for k in range(center, right):
+            if right != center:
+                fbank[i, k] = (right - k) / (right - center)
+    return fbank
+
+
+def stft_magnitude(samples: np.ndarray, frame_length: int, hop_length: int,
+                   n_fft: int | None = None) -> np.ndarray:
+    """Short-time magnitude spectrum, shape ``(n_frames, n_fft//2+1)``."""
+    if n_fft is None:
+        n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
+    frames = frame_signal(samples, frame_length, hop_length, center=False)
+    if len(frames) == 0:
+        return np.empty((0, n_fft // 2 + 1), dtype=np.float64)
+    n_pad = n_fft - frames.shape[1]
+    if n_pad > 0:
+        frames = np.pad(frames, ((0, 0), (0, n_pad)))
+    else:
+        frames = frames[:, :n_fft]
+    spec = np.abs(rfft(frames, axis=1))
+    return spec
+
+
+# --------------------------------------------------------------------------
+# spectral features
+# --------------------------------------------------------------------------
+
+def mel_spectrogram(samples: np.ndarray, sr: int, n_mels: int = 80,
+                     frame_length: int | None = None, hop_length: int | None = None,
+                     fmin: float = 0.0, fmax: float | None = None) -> np.ndarray:
+    """Log-mel spectrogram in dB, shape ``(n_frames, n_mels)``."""
+    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
+    n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
+    mag = stft_magnitude(samples, frame_length, hop_length, n_fft)
+    power = mag ** 2
+    fbank = mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
+    mel = power @ fbank.T
+    return db(mel)
+
+
+def mfcc(samples: np.ndarray, sr: int, n_mfcc: int = 13, n_mels: int = 26,
+         frame_length: int | None = None, hop_length: int | None = None,
+         fmin: float = 0.0, fmax: float | None = None,
+         lifter: float = 22.0) -> np.ndarray:
+    """MFCC matrix of shape ``(n_frames, n_mfcc)`` (coefficient 0 kept)."""
+    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
+    n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
+    mag = stft_magnitude(samples, frame_length, hop_length, n_fft)
+    power = mag ** 2
+    fbank = mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
+    log_mel = np.log(np.maximum(power @ fbank.T, 1e-10))
+    coeffs = dct(log_mel, axis=1, type=2, norm="ortho")[:, :n_mfcc]
+    if lifter and lifter > 0:  # sinusoidal liftering
+        n = np.arange(coeffs.shape[1])
+        w = 1 + 0.5 * lifter * np.sin(np.pi * n / lifter)
+        coeffs = coeffs * w
+    return coeffs
+
+
+def frame_energy(samples: np.ndarray, sr: int,
+                 frame_length: int | None = None,
+                 hop_length: int | None = None) -> np.ndarray:
+    """Short-time RMS energy in dB per frame."""
+    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
+    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=False)
+    if len(frames) == 0:
+        return np.empty(0)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    return db(rms ** 2)
+
+
+def _defaults(sr: int, frame_length: int | None, hop_length: int | None):
+    if frame_length is None or hop_length is None:
+        fl, hl = default_frame_lengths(sr)
+        frame_length = fl if frame_length is None else frame_length
+        hop_length = hl if hop_length is None else hop_length
+    return frame_length, hop_length
+
+
+# --------------------------------------------------------------------------
+# pitch
+# --------------------------------------------------------------------------
+
+@dataclass
+class F0Track:
+    """Result of pitch tracking.
+
+    Attributes
+    ----------
+    times : np.ndarray  — frame centre times in seconds
+    f0 : np.ndarray     — F0 in Hz (0 for unvoiced frames)
+    voiced : np.ndarray — boolean voicing decisions
+    """
+
+    times: np.ndarray
+    f0: np.ndarray
+    voiced: np.ndarray
+
+    @property
+    def voiced_ratio(self) -> float:
+        """Fraction of frames marked as voiced."""
+        return float(np.mean(self.voiced)) if len(self.voiced) else 0.0
+
+    def summary(self) -> dict:
+        """Descriptive statistics over voiced frames."""
+        v = self.f0[self.voiced]
+        if len(v) == 0:
+            return {"voiced_ratio": 0.0, "n_voiced_frames": 0}
+        return {
+            "voiced_ratio": float(np.mean(self.voiced)),
+            "n_voiced_frames": int(np.sum(self.voiced)),
+            "f0_mean_hz": float(np.mean(v)),
+            "f0_median_hz": float(np.median(v)),
+            "f0_std_hz": float(np.std(v)),
+            "f0_min_hz": float(np.min(v)),
+            "f0_max_hz": float(np.max(v)),
+        }
+
+
+def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
+             frame_length: int | None = None, hop_length: int | None = None,
+             voicing_threshold: float = 0.35,
+             energy_floor_db: float = -55.0) -> F0Track:
+    """Autocorrelation-based F0 tracker.
+
+    Parameters
+    ----------
+    fmin, fmax : pitch search range in Hz (60–500 covers adult speech).
+    voicing_threshold : minimum normalised autocorrelation for a voiced frame.
+    energy_floor_db : frames below this RMS dB are never voiced.
+    """
+    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
+    lag_min = max(2, int(np.floor(sr / fmax)))
+    lag_max = int(np.ceil(sr / fmin))
+    if lag_max >= frame_length:
+        lag_max = frame_length - 1
+    if lag_min >= lag_max:
+        raise ValueError("pitch search range does not fit the analysis frame")
+
+    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=True)
+    n_frames = len(frames)
+    times = (np.arange(n_frames) * hop_length + frame_length / 2 - frame_length // 2) / sr
+
+    f0 = np.zeros(n_frames)
+    voiced = np.zeros(n_frames, dtype=bool)
+
+    if n_frames == 0:
+        return F0Track(times=times, f0=f0, voiced=voiced)
+
+    # energy gate
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms_db = db(rms ** 2)
+    active = rms_db > energy_floor_db
+
+    # normalised cross-correlation over the lag range, vectorised over frames.
+    # NCCF: r(lag) = sum x(t)x(t+lag) / sqrt(sum x(t)^2 * sum x(t+lag)^2)
+    # (over the overlapping region) so that perfectly periodic frames score 1.
+    lags = np.arange(lag_min, lag_max + 1)
+    n_active = int(np.sum(active))
+    if n_active == 0:
+        return F0Track(times=times, f0=f0, voiced=voiced)
+
+    act_idx = np.where(active)[0]
+    fx = frames[act_idx] - frames[act_idx].mean(axis=1, keepdims=True)
+    # cumulative energies for O(1) segment-energy lookups
+    cum = np.concatenate([np.zeros((n_active, 1)), np.cumsum(fx ** 2, axis=1)], axis=1)
+
+    ac = np.empty((n_active, len(lags)), dtype=np.float64)
+    for j, lag in enumerate(lags):
+        num = np.einsum("ij,ij->i", fx[:, : frame_length - lag], fx[:, lag:])
+        e1 = cum[:, frame_length - lag]                       # energy of x[:N-lag]
+        e2 = cum[:, frame_length] - cum[:, lag]                # energy of x[lag:]
+        ac[:, j] = num / np.sqrt(np.maximum(e1 * e2, 1e-20))
+
+    for i, fi in enumerate(act_idx):
+        a = ac[i]
+        r_max = float(a.max())
+        if r_max < voicing_threshold:
+            continue
+        # Autocorrelation of a periodic signal peaks at every integer
+        # multiple of the period.  Choosing the *shortest* lag within a
+        # tolerance of the maximum avoids subharmonic (octave-down) errors.
+        thr = 0.85 * r_max
+        j = int(np.argmax(a >= thr))
+        # parabolic interpolation around the peak
+        lag_est = float(lags[j])
+        if 0 < j < len(a) - 1:
+            y0, y1, y2 = a[j - 1], a[j], a[j + 1]
+            denom_p = y0 - 2 * y1 + y2
+            if abs(denom_p) > 1e-9:
+                lag_est = lags[j] + 0.5 * (y0 - y2) / denom_p
+        if lag_est > 0:
+            f0[fi] = sr / lag_est
+            voiced[fi] = True
+
+    # octave-jump suppression: median filter over voiced frames
+    if np.any(voiced):
+        from scipy.signal import medfilt
+
+        v_idx = np.where(voiced)[0]
+        if len(v_idx) >= 3:
+            smoothed = medfilt(f0[v_idx], 3)
+            f0[v_idx] = smoothed
+
+    return F0Track(times=times, f0=f0, voiced=voiced)
+
+
+# --------------------------------------------------------------------------
+# LPC / formants
+# --------------------------------------------------------------------------
+
+def lpc(samples: np.ndarray, order: int) -> np.ndarray:
+    """Linear prediction coefficients (a_1..a_order) via Levinson-Durbin.
+
+    Returns the denominator polynomial without the leading 1.
+    """
+    from scipy.linalg import solve_toeplitz
+
+    x = np.asarray(samples, dtype=np.float64)
+    x = x - x.mean()
+    if len(x) <= order:
+        raise ValueError("frame too short for the requested LPC order")
+    r = np.correlate(x, x, mode="full")[len(x) - 1 : len(x) - 1 + order + 1]
+    if np.allclose(r[0], 0.0):
+        return np.zeros(order)
+    a = solve_toeplitz(r[:order], r[1 : order + 1])
+    return np.asarray(a, dtype=np.float64)
+
+
+def _auto_pre_emphasis(sr: int) -> float:
+    """Pre-emphasis coefficient giving a -3 dB corner at 50 Hz (Praat-style).
+
+    A fixed 0.97 coefficient is far too aggressive at 16 kHz — it flattens
+    the whole F1 region — so the coefficient is derived from the sample rate.
+    """
+    w = 2.0 * np.pi * 50.0 / sr
+    c = float(np.cos(w))
+    disc = c * c - 0.5
+    if disc <= 0:  # only for absurdly low sample rates
+        return 0.0
+    return c - np.sqrt(disc)
+
+
+def formants(samples: np.ndarray, sr: int, order: int | None = None,
+             pre_emphasis: float | None = None,
+             max_formants: int = 4) -> list[float]:
+    """Estimate formant frequencies (Hz) for one analysis frame via LPC roots.
+
+    Parameters
+    ----------
+    order : LPC order; defaults to ``min(16, 2 + sr/1000)``.
+    pre_emphasis : coefficient; ``None`` derives one from the sample rate
+        (50 Hz corner).  Pass ``0.0`` to disable.
+    """
+    if order is None:
+        order = min(16, int(2 + sr / 1000.0))
+    if pre_emphasis is None:
+        pre_emphasis = _auto_pre_emphasis(sr)
+    x = np.asarray(samples, dtype=np.float64)
+    if pre_emphasis:
+        x = np.append(x[0], x[1:] - pre_emphasis * x[:-1])
+    a = lpc(x, order)
+    poly = np.concatenate(([1.0], a))
+    roots = np.roots(poly)
+
+    freqs = []
+    for r in roots:
+        if abs(r.imag) <= 1e-10:
+            continue
+        freq = np.angle(r) * sr / (2 * np.pi)
+        if 90.0 < freq < sr / 2.0 - 50.0:  # skip DC/Nyquist-adjacent roots
+            freqs.append((freq, abs(r)))
+    freqs.sort()
+    out = [float(f) for f, _ in freqs[:max_formants]]
+    return out
+
+
+# --------------------------------------------------------------------------
+# voice quality
+# --------------------------------------------------------------------------
+
+@dataclass
+class JitterShimmer:
+    """Perturbation measures computed from glottal-pulse epochs."""
+
+    jitter_local_percent: float
+    shimmer_local_db: float
+    n_periods: int
+
+    def summary(self) -> dict:
+        return {
+            "jitter_local_percent": self.jitter_local_percent,
+            "shimmer_local_db": self.shimmer_local_db,
+            "n_periods": self.n_periods,
+        }
+
+
+def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
+                 fmax: float = 500.0) -> tuple[np.ndarray, np.ndarray]:
+    """Locate glottal pulse epochs (waveform peaks) for perturbation measures.
+
+    A rough F0 is estimated first, the signal is low-pass smoothed over a
+    quarter period to suppress formant ripple, and peaks are then picked with
+    a minimum spacing of 0.6·period.
+
+    Returns ``(epoch_indices, peak_amplitudes)``.
+    """
+    x = np.asarray(samples, dtype=np.float64)
+    if len(x) < int(sr / fmin) * 3:
+        return np.empty(0, dtype=int), np.empty(0)
+
+    track = f0_track(x, sr, fmin=fmin, fmax=fmax)
+    voiced_f0 = track.f0[track.voiced]
+    if len(voiced_f0) == 0:
+        return np.empty(0, dtype=int), np.empty(0)
+    period = sr / float(np.median(voiced_f0))
+
+    # invert if the waveform is dominantly negative so peaks align with pulses
+    if np.percentile(x, 75) < 0:
+        x = -x
+
+    # low-pass smoothing kills inter-pulse formant oscillation
+    win_len = max(3, round(period * 0.25))
+    if win_len % 2 == 0:
+        win_len += 1
+    kernel = np.hanning(win_len)
+    kernel = kernel / kernel.sum() if kernel.sum() > 0 else kernel
+    xs = np.convolve(x, kernel, mode="same")
+
+    min_dist = max(2, round(0.6 * period))
+    threshold = 0.1 * np.max(np.abs(xs))
+    epochs: list[int] = []
+    i = 1
+    n = len(xs)
+    while i < n - 1:
+        is_peak = xs[i] > threshold and xs[i] >= xs[i - 1] and xs[i] > xs[i + 1]
+        if is_peak and (not epochs or i - epochs[-1] >= min_dist):
+            epochs.append(i)
+            i += min_dist
+            continue
+        i += 1
+
+    epochs_arr = np.asarray(epochs, dtype=int)
+    if len(epochs_arr) >= 2:
+        # drop periods outside the plausible F0 range
+        periods = np.diff(epochs_arr) / sr
+        good = (periods >= 1.0 / fmax) & (periods <= 1.0 / fmin)
+        if not np.all(good):
+            keep = [epochs_arr[0]]
+            for k in range(1, len(epochs_arr)):
+                if good[k - 1]:
+                    keep.append(epochs_arr[k])
+            epochs_arr = np.asarray(keep, dtype=int)
+    return epochs_arr, x[epochs_arr] if len(epochs_arr) else np.empty(0)
+
+
+def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
+                   fmax: float = 500.0) -> JitterShimmer:
+    """Local jitter (%) and shimmer (dB) from consecutive glottal periods.
+
+    Typical sustained-vowel values: jitter < 1 %, shimmer < 0.4 dB indicate
+    a healthy voice; both rise with vocal pathology.
+    """
+    epochs, peaks = _find_epochs(samples, sr, fmin, fmax)
+    if len(epochs) < 3:
+        return JitterShimmer(jitter_local_percent=float("nan"),
+                             shimmer_local_db=float("nan"), n_periods=0)
+
+    periods = np.diff(epochs) / sr
+    jitter = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods) * 100.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        amp_ratios = peaks[1:] / np.where(np.abs(peaks[:-1]) < 1e-12, np.nan, peaks[:-1])
+        shimmer = 20.0 * np.log10(np.abs(amp_ratios))
+        shimmer = float(np.nanmean(shimmer)) if np.any(np.isfinite(shimmer)) else float("nan")
+    return JitterShimmer(jitter_local_percent=jitter,
+                         shimmer_local_db=shimmer, n_periods=len(periods))
+
+
+def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
+        frame_length: int | None = None, hop_length: int | None = None) -> float:
+    """Harmonics-to-noise ratio in dB, estimated from autocorrelation.
+
+    Uses the relation HNR ≈ 10·log10(r/(1−r)) at the best F0 lag, averaged
+    over voiced frames.  Values above ~20 dB indicate a tonal, stable voice.
+    """
+    track = f0_track(samples, sr, fmin=fmin, fmax=fmax,
+                     frame_length=frame_length, hop_length=hop_length)
+    if not np.any(track.voiced):
+        return float("nan")
+
+    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
+    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=True)
+    vals = []
+    for i in np.where(track.voiced)[0]:
+        if i >= len(frames):
+            continue
+        fx = frames[i]
+        fx = fx - fx.mean()
+        d2 = np.sum(fx ** 2)
+        if d2 < 1e-10:
+            continue
+        lag = round(sr / max(track.f0[i], 1e-6))
+        if lag <= 0 or lag >= frame_length:
+            continue
+        num = float(np.sum(fx[:-lag] * fx[lag:]))
+        # NCCF-style normalisation over the overlapping segments
+        e1 = float(np.sum(fx[:-lag] ** 2))
+        e2 = float(np.sum(fx[lag:] ** 2))
+        r_val = num / max(np.sqrt(e1 * e2), 1e-20)
+        r_val = min(max(r_val, 1e-6), 0.999999)
+        vals.append(10.0 * np.log10(r_val / (1.0 - r_val)))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+# --------------------------------------------------------------------------
+# convenience: full analysis
+# --------------------------------------------------------------------------
+
+def analyze(audio: AudioData) -> dict:
+    """Run a standard acoustic analysis and return a JSON-ready dict."""
+    sr, x = audio.sample_rate, audio.samples
+    track = f0_track(x, sr)
+    js = jitter_shimmer(x, sr)
+    fl, hl = default_frame_lengths(sr)
+    # median formants over the most energetic voiced frames
+    frames = frame_signal(x, fl, hl, window="rect", center=True)
+    energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12) if len(frames) else np.empty(0)
+    top = np.argsort(energy)[-max(5, len(energy) // 10):] if len(energy) else []
+    formant_rows = [formants(frames[i], sr) for i in top]
+    formant_rows = [r for r in formant_rows if len(r) >= 3]
+    if formant_rows:
+        f_stack = np.vstack([r[:3] for r in formant_rows])
+        formant_summary = {
+            "F1_hz": float(np.median(f_stack[:, 0])),
+            "F2_hz": float(np.median(f_stack[:, 1])),
+            "F3_hz": float(np.median(f_stack[:, 2])),
+        }
+    else:
+        formant_summary = {}
+
+    return {
+        "file": audio.path,
+        "duration_s": round(audio.duration, 3),
+        "sample_rate_hz": sr,
+        "n_samples": int(audio.num_samples),
+        "pitch": track.summary(),
+        "voice_quality": js.summary(),
+        "hnr_db": round(hnr(x, sr), 2) if len(x) else float("nan"),
+        "formants": formant_summary,
+    }
