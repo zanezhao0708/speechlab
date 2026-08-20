@@ -1,20 +1,19 @@
-"""Acoustic feature extraction for speech research.
+"""Acoustic analysis core used by the research agent.
 
 All analysers follow the same conventions:
 
 * signals are mono float64 arrays (see :mod:`speechlab.audio`);
 * frames are 25 ms long with a 10 ms hop by default;
 * every function returns plain floats / numpy arrays so results can be
-  JSON-serialised easily for downstream statistics or LLM consumption.
+  JSON-serialised for LLM consumption.
 
 Features
 --------
-- ``mel_spectrogram`` / ``mfcc`` : spectral features,
-- ``frame_energy`` : short-time RMS energy in dB,
 - ``f0_track`` : autocorrelation pitch tracker with parabolic refinement,
 - ``lpc`` / ``formants`` : linear prediction and formant estimation,
 - ``jitter_shimmer`` : voice-quality perturbation measures,
-- ``hnr`` : harmonics-to-noise ratio estimate.
+- ``hnr`` : harmonics-to-noise ratio estimate,
+- ``analyze`` : the single entry point the agent calls as a tool.
 """
 
 from __future__ import annotations
@@ -22,25 +21,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.fft import dct, rfft
 
 from .audio import AudioData, db, frame_signal
 
 __all__ = [
     "F0Track",
     "JitterShimmer",
+    "analyze",
+    "default_frame_lengths",
     "f0_track",
     "formants",
-    "frame_energy",
     "hnr",
-    "hz_to_mel",
     "jitter_shimmer",
     "lpc",
-    "mel_filterbank",
-    "mel_spectrogram",
-    "mel_to_hz",
-    "mfcc",
-    "stft_magnitude",
 ]
 
 
@@ -51,123 +44,6 @@ __all__ = [
 def default_frame_lengths(sr: int) -> tuple[int, int]:
     """Return (frame_length, hop_length) for 25 ms / 10 ms at ``sr``."""
     return max(1, round(sr * 0.025)), max(1, round(sr * 0.010))
-
-
-def hz_to_mel(f: np.ndarray | float) -> np.ndarray | float:
-    """Slaney-style mel scale (matches librosa's default)."""
-    f_min, f_sp = 0.0, 200.0 / 3.0
-    mels = (np.asarray(f, dtype=np.float64) - f_min) / f_sp
-    min_log_hz = 1000.0
-    min_log_mel = (min_log_hz - f_min) / f_sp
-    logstep = np.log(6.4) / 27.0
-    if np.isscalar(f):
-        if f > min_log_hz:
-            return min_log_mel + np.log(f / min_log_hz) / logstep
-        return float(mels)
-    log_t = f > min_log_hz
-    mels[log_t] = min_log_mel + np.log(f[log_t] / min_log_hz) / logstep
-    return mels
-
-
-def mel_to_hz(m: np.ndarray | float) -> np.ndarray | float:
-    """Inverse of :func:`hz_to_mel`."""
-    f_min, f_sp = 0.0, 200.0 / 3.0
-    freqs = np.asarray(m, dtype=np.float64) * f_sp + f_min
-    min_log_hz = 1000.0
-    min_log_mel = (min_log_hz - f_min) / f_sp
-    logstep = np.log(6.4) / 27.0
-    if np.isscalar(m):
-        if m > min_log_mel:
-            return min_log_hz * np.exp(logstep * (m - min_log_mel))
-        return float(freqs)
-    log_t = m > min_log_mel
-    freqs[log_t] = min_log_hz * np.exp(logstep * (m[log_t] - min_log_mel))
-    return freqs
-
-
-def mel_filterbank(sr: int, n_fft: int, n_mels: int = 26, fmin: float = 0.0,
-                   fmax: float | None = None) -> np.ndarray:
-    """Triangular mel filterbank of shape ``(n_mels, n_fft//2+1)``."""
-    if fmax is None:
-        fmax = sr / 2.0
-    mel_pts = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2)
-    hz_pts = mel_to_hz(mel_pts)
-    bins = np.floor((n_fft + 1) * hz_pts / sr).astype(int)
-    fbank = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
-    for i in range(n_mels):
-        left, center, right = bins[i], bins[i + 1], bins[i + 2]
-        for k in range(left, center):
-            if center != left:
-                fbank[i, k] = (k - left) / (center - left)
-        for k in range(center, right):
-            if right != center:
-                fbank[i, k] = (right - k) / (right - center)
-    return fbank
-
-
-def stft_magnitude(samples: np.ndarray, frame_length: int, hop_length: int,
-                   n_fft: int | None = None) -> np.ndarray:
-    """Short-time magnitude spectrum, shape ``(n_frames, n_fft//2+1)``."""
-    if n_fft is None:
-        n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
-    frames = frame_signal(samples, frame_length, hop_length, center=False)
-    if len(frames) == 0:
-        return np.empty((0, n_fft // 2 + 1), dtype=np.float64)
-    n_pad = n_fft - frames.shape[1]
-    if n_pad > 0:
-        frames = np.pad(frames, ((0, 0), (0, n_pad)))
-    else:
-        frames = frames[:, :n_fft]
-    spec = np.abs(rfft(frames, axis=1))
-    return spec
-
-
-# --------------------------------------------------------------------------
-# spectral features
-# --------------------------------------------------------------------------
-
-def mel_spectrogram(samples: np.ndarray, sr: int, n_mels: int = 80,
-                     frame_length: int | None = None, hop_length: int | None = None,
-                     fmin: float = 0.0, fmax: float | None = None) -> np.ndarray:
-    """Log-mel spectrogram in dB, shape ``(n_frames, n_mels)``."""
-    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
-    n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
-    mag = stft_magnitude(samples, frame_length, hop_length, n_fft)
-    power = mag ** 2
-    fbank = mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
-    mel = power @ fbank.T
-    return db(mel)
-
-
-def mfcc(samples: np.ndarray, sr: int, n_mfcc: int = 13, n_mels: int = 26,
-         frame_length: int | None = None, hop_length: int | None = None,
-         fmin: float = 0.0, fmax: float | None = None,
-         lifter: float = 22.0) -> np.ndarray:
-    """MFCC matrix of shape ``(n_frames, n_mfcc)`` (coefficient 0 kept)."""
-    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
-    n_fft = 1 << max(1, int(np.ceil(np.log2(frame_length))))
-    mag = stft_magnitude(samples, frame_length, hop_length, n_fft)
-    power = mag ** 2
-    fbank = mel_filterbank(sr, n_fft, n_mels, fmin, fmax)
-    log_mel = np.log(np.maximum(power @ fbank.T, 1e-10))
-    coeffs = dct(log_mel, axis=1, type=2, norm="ortho")[:, :n_mfcc]
-    if lifter and lifter > 0:  # sinusoidal liftering
-        n = np.arange(coeffs.shape[1])
-        w = 1 + 0.5 * lifter * np.sin(np.pi * n / lifter)
-        coeffs = coeffs * w
-    return coeffs
-
-
-def frame_energy(samples: np.ndarray, sr: int,
-                 frame_length: int | None = None,
-                 hop_length: int | None = None) -> np.ndarray:
-    """Short-time RMS energy in dB per frame."""
-    frame_length, hop_length = _defaults(sr, frame_length, hop_length)
-    frames = frame_signal(samples, frame_length, hop_length, window="rect", center=False)
-    if len(frames) == 0:
-        return np.empty(0)
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
-    return db(rms ** 2)
 
 
 def _defaults(sr: int, frame_length: int | None, hop_length: int | None):
@@ -514,7 +390,7 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
 
 
 # --------------------------------------------------------------------------
-# convenience: full analysis
+# the agent's tool entry point
 # --------------------------------------------------------------------------
 
 def analyze(audio: AudioData) -> dict:

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "speechlab"
-version = "0.1.0"
-description = "A toolkit and LLM agent for speech-science research: acoustics, corpus tools and a tool-using research assistant."
+version = "0.2.0"
+description = "An LLM research agent for speech science: a tool-calling assistant grounded in locally measured acoustics (F0, formants, jitter/shimmer, HNR)."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "SpeechLab contributors" }]
 requires-python = ">=3.10"
-keywords = ["speech", "phonetics", "acoustics", "voice", "research", "agent"]
+keywords = ["speech", "phonetics", "acoustics", "voice", "research", "agent", "llm"]
 classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",

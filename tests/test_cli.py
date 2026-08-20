@@ -17,20 +17,6 @@ def sample_wav(tmp_path):
     return str(path)
 
 
-@pytest.fixture()
-def corpus(tmp_path):
-    for spk in ("spk01", "spk02"):
-        for i in range(2):
-            write_wav(str(tmp_path / f"{spk}_{i}.wav"),
-                      vowel_like(duration_s=0.3 + 0.1 * i), 16000)
-    return str(tmp_path)
-
-
-def _first_json(text: str) -> dict:
-    """Parse the first JSON object in CLI output (stderr may be appended)."""
-    return json.JSONDecoder().raw_decode(text)[0]
-
-
 def test_cli_version():
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
@@ -61,55 +47,6 @@ def test_cli_analyze_json(sample_wav):
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["pitch"]["f0_median_hz"] == pytest.approx(130.0, rel=0.05)
-
-
-def test_cli_quality(sample_wav):
-    runner = CliRunner()
-    result = runner.invoke(main, ["quality", sample_wav])
-    assert result.exit_code == 0
-    data = _first_json(result.output)
-    assert "snr_db" in data
-
-
-def test_cli_features_mfcc(sample_wav):
-    runner = CliRunner()
-    result = runner.invoke(main, ["features", sample_wav, "--type", "mfcc"])
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert data["feature"] == "mfcc"
-    assert len(data["matrix"]) > 10
-    assert len(data["matrix"][0]) == 13
-
-
-def test_cli_features_f0(sample_wav):
-    runner = CliRunner()
-    result = runner.invoke(main, ["features", sample_wav, "--type", "f0"])
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert len(data["f0_hz"]) == len(data["times_s"]) == len(data["voiced"])
-
-
-def test_cli_report(corpus, tmp_path):
-    out = tmp_path / "report.json"
-    runner = CliRunner()
-    result = runner.invoke(main, ["report", corpus, "-o", str(out)])
-    assert result.exit_code == 0
-    data = _first_json(result.output)
-    assert data["n_files"] == 4
-    assert data["n_speakers"] == 2
-    assert out.exists()
-
-
-def test_cli_split(corpus, tmp_path):
-    out = tmp_path / "split.json"
-    runner = CliRunner()
-    result = runner.invoke(main, ["split", corpus, "--train", "0.5", "--dev", "0.25",
-                                  "--test", "0.25", "-o", str(out)])
-    assert result.exit_code == 0
-    data = json.loads(out.read_text())
-    assert set(data) == {"train", "dev", "test"}
-    total = sum(len(v) for v in data.values())
-    assert total == 4
 
 
 def test_cli_agent_without_key(sample_wav, monkeypatch):

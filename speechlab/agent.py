@@ -1,9 +1,9 @@
 """An LLM-powered speech-research assistant with tool use.
 
 The agent talks to any OpenAI-compatible ``/chat/completions`` endpoint and
-can invoke SpeechLab's local analysis tools (``analyze_audio``,
-``audio_quality``, ``dataset_report``) through standard function calling,
-so the model grounds its answers in measured acoustics instead of guessing.
+can invoke SpeechLab's local acoustic analysis (``analyze_audio``) through
+standard function calling, so the model grounds its answers in measured
+acoustics instead of guessing.
 
 Configuration (environment variables):
 
@@ -16,17 +16,13 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .audio import load_audio
-from .dataset import dataset_report as _dataset_report
-from .dataset import scan_dataset
 from .features import analyze as _analyze_audio
-from .quality import quality_report as _quality_report
 
 __all__ = ["RESEARCH_SYSTEM_PROMPT", "AgentConfig", "SpeechResearchAgent", "build_tool_specs"]
 
@@ -43,9 +39,8 @@ You are knowledgeable about:
 - speech technology (ASR, TTS, speaker verification) and standard benchmarks.
 
 Ground rules:
-1. When the user mentions a local audio file or corpus directory, ALWAYS use
-   the provided tools (analyze_audio / audio_quality / dataset_report) to
-   obtain measurements before interpreting them.  Never invent numbers.
+1. When the user mentions a local audio file, ALWAYS use the analyze_audio
+   tool to obtain measurements before interpreting them.  Never invent numbers.
 2. Report units (Hz, dB, ms, %) alongside every measurement and note normal
    ranges when giving clinical interpretations, with the caveat that clinical
    decisions require a certified professional.
@@ -82,7 +77,7 @@ class AgentConfig:
 
 
 def build_tool_specs() -> list[dict]:
-    """OpenAI function-calling schema for the local analysis tools."""
+    """OpenAI function-calling schema for the local analysis tool."""
     return [
         {
             "type": "function",
@@ -96,47 +91,6 @@ def build_tool_specs() -> list[dict]:
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "path to the audio file"},
-                    },
-                    "required": ["path"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "audio_quality",
-                "description": (
-                    "Recording-quality report: clipping, DC offset, SNR estimate, "
-                    "silence ratio and a list of detected issues."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "path to the audio file"},
-                    },
-                    "required": ["path"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "dataset_report",
-                "description": (
-                    "Scan a corpus directory and report file counts, duration "
-                    "statistics, speaker breakdown and sample rates."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "corpus root directory"},
-                        "speaker_pattern": {
-                            "type": "string",
-                            "description": (
-                                "optional regex with a named group (?P<speaker>...) "
-                                "for extracting speaker IDs from file names"
-                            ),
-                        },
                     },
                     "required": ["path"],
                 },
@@ -175,19 +129,7 @@ class SpeechResearchAgent:
         def analyze_audio(args: dict) -> dict:
             return _analyze_audio(load_audio(args["path"]))
 
-        def audio_quality(args: dict) -> dict:
-            return _quality_report(load_audio(args["path"]))
-
-        def dataset_report(args: dict) -> dict:
-            utterances = scan_dataset(args["path"],
-                                       speaker_pattern=args.get("speaker_pattern"))
-            return _dataset_report(utterances)
-
-        return {
-            "analyze_audio": analyze_audio,
-            "audio_quality": audio_quality,
-            "dataset_report": dataset_report,
-        }
+        return {"analyze_audio": analyze_audio}
 
     # ------------------------------------------------------------------
     # transport

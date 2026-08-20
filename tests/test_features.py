@@ -1,63 +1,18 @@
-"""Tests for acoustic feature extraction."""
+"""Tests for the acoustic analysis core used by the agent."""
 
 import numpy as np
 import pytest
 
 from speechlab.audio import load_audio
 from speechlab.features import (
+    analyze,
     f0_track,
     formants,
-    frame_energy,
     hnr,
-    hz_to_mel,
     jitter_shimmer,
-    mel_filterbank,
-    mel_spectrogram,
-    mel_to_hz,
-    mfcc,
 )
 
 from .helpers import noise, tone, vowel_like, write_wav
-
-
-# ---------------------------------------------------------------- mel / MFCC
-def test_mel_scale_roundtrip():
-    for f in (100.0, 1000.0, 4000.0, 7999.0):
-        m = hz_to_mel(f)
-        assert float(mel_to_hz(m)) == pytest.approx(f, rel=1e-6)
-
-
-def test_mel_filterbank_shape():
-    fb = mel_filterbank(16000, 512, n_mels=26)
-    assert fb.shape == (26, 257)
-    assert np.all(fb >= 0)
-    # filters should not overlap the whole spectrum
-    assert np.all(fb[0] > -1e-9)
-
-
-def test_mel_spectrogram_shape():
-    sr = 16000
-    x = noise(1.0, sr=sr)
-    mel = mel_spectrogram(x, sr, n_mels=64)
-    assert mel.shape[1] == 64
-    # ~100 frames per second at 10 ms hop
-    assert mel.shape[0] == pytest.approx(100, abs=15)
-
-
-def test_mfcc_shape_and_finiteness():
-    sr = 16000
-    x = vowel_like(duration_s=0.5, sr=sr)
-    c = mfcc(x, sr, n_mfcc=13)
-    assert c.shape == (c.shape[0], 13)
-    assert np.all(np.isfinite(c))
-
-
-def test_mfcc_energy_rises_with_loudness():
-    sr = 16000
-    quiet = mfcc(0.1 * tone(500.0, 0.5, sr=sr), sr)
-    loud = mfcc(0.9 * tone(500.0, 0.5, sr=sr), sr)
-    # c0 tracks log energy
-    assert np.mean(loud[:, 0]) > np.mean(quiet[:, 0]) + 3.0
 
 
 # --------------------------------------------------------------------- pitch
@@ -135,7 +90,6 @@ def test_analyze_end_to_end(tmp_path):
     sr = 16000
     x = vowel_like(f0_hz=140.0, duration_s=0.8, sr=sr)
     path = write_wav(str(tmp_path / "utt.wav"), x, sr)
-    from speechlab.features import analyze
 
     report = analyze(load_audio(path))
     assert report["duration_s"] == pytest.approx(0.8, abs=0.01)
@@ -143,10 +97,3 @@ def test_analyze_end_to_end(tmp_path):
     assert report["pitch"]["f0_median_hz"] == pytest.approx(140.0, rel=0.05)
     assert report["voice_quality"]["n_periods"] > 30
     assert set(report["formants"]) == {"F1_hz", "F2_hz", "F3_hz"}
-
-
-def test_frame_energy_range():
-    sr = 16000
-    e = frame_energy(tone(300.0, 0.3, sr=sr, amp=0.5), sr)
-    assert len(e) > 10
-    assert np.all(np.isfinite(e))

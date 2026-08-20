@@ -1,23 +1,23 @@
-"""SpeechLab: a toolkit and LLM agent for speech-science research.
+"""SpeechLab: an LLM research agent for speech science.
+
+The agent talks to any OpenAI-compatible chat API and grounds its answers
+in locally measured acoustics through tool calling.
 
 Modules
 -------
 audio    : loading, resampling and basic audio utilities.
-features : acoustic feature extraction (F0, formants, MFCC, energy, jitter/shimmer, HNR).
-quality  : recording quality checks (clipping, DC offset, SNR, silence ratio).
-dataset  : corpus statistics and speaker-independent dataset splitting.
-agent    : an LLM research assistant that can call the local analysis tools.
+features : the acoustic analysis core the agent calls as a tool
+           (F0, formants, jitter/shimmer, HNR).
+agent    : the LLM research assistant with the tool-calling loop.
 cli      : command line interface.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
     "agent",
     "audio",
     "cli",
-    "dataset",
     "features",
-    "quality",
 ]
