@@ -60,7 +60,38 @@ speechlab agent "Interpret these voice measures" --context patient.wav
 # the analysis the agent runs under the hood, standalone:
 speechlab analyze patient.wav
 speechlab info patient.wav
+
+# batch-analyse many files, one CSV row per file (20+ measures):
+speechlab batch recordings/*.wav --csv results.csv
 ```
+
+## Web chat interface
+
+```bash
+python web/app.py          # http://localhost:8000
+```
+
+A chatbot-style web UI for people who don't use the CLI:
+
+- **Chat** — multi-turn agent conversations; users bring their own API key
+  (stored in their browser only) or the server provides one via
+  `SPEECHLAB_API_KEY`.
+- **Browser recording** — record from the mic, get an instant local
+  analysis; the recording is also attached as agent context.
+- **Direct analysis (no API key)** — upload or record audio and get the
+  full local report: F0 statistics, jitter/shimmer (measured on the
+  longest sustained voiced segment), HNR, formants, spectrogram,
+  pitch contour, pause/speech-rate structure, recording-quality flags
+  with literature-based ✓/△/✗ grading, and one-click Markdown export.
+- **Multi-file comparison** — select several files at once for a side-by-side
+  table (best values highlighted) with per-speaker F0 contours.
+- **Longitudinal trends** — measurements are saved locally in the browser
+  and charted over time for therapy/training progress tracking.
+
+Deployment notes: sessions are in-memory (dev server); add a reverse
+proxy, TLS and authentication before exposing it publicly. The server
+enforces per-session upload quotas (200 MB), chat rate limits
+(8 requests/min) and caps concurrent LLM calls.
 
 Python API:
 
@@ -110,8 +141,13 @@ distinguish established results from hypotheses.
   Nyquist roots discarded.
 - **Jitter/shimmer**: epoch picking on a low-pass smoothed waveform
   (quarter-period smoothing suppresses formant ripple), local
-  period-to-period and amplitude perturbation.
+  period-to-period and amplitude perturbation. Computed on the longest
+  sustained voiced segment when one exists — perturbation norms assume a
+  sustained vowel, not connected speech.
 - **HNR**: autocorrelation-based, `10·log10(r/(1−r))` at the tracked F0 lag.
+- **Temporal structure**: energy-gated pauses (≥0.2 s) and a syllable-nuclei
+  estimate from smoothed energy peaks (de Jong & Wempe style) — a rough
+  articulation-rate proxy, not a forced-alignment replacement.
 
 These are classical, lightweight implementations intended for research
 triage; for publication-grade clinical numbers, cross-check against Praat

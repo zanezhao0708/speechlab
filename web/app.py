@@ -19,8 +19,9 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -32,6 +33,9 @@ from speechlab.features import analyze
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 ALLOWED_EXT = {".wav", ".wave", ".mp3", ".flac", ".ogg"}
 MAX_SESSIONS = 64
+SESSION_UPLOAD_QUOTA = 200 * 1024 * 1024   # total bytes per session
+CHAT_RATE_LIMIT = (8, 60.0)                # max 8 chat calls per 60 s
+CHAT_CONCURRENCY = 4                       # simultaneous LLM calls server-wide
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB uploads
@@ -47,10 +51,16 @@ class Session:
         default_factory=lambda: tempfile.mkdtemp(prefix="speechlab-web-")
     )
     files: dict[str, str] = field(default_factory=dict)  # stored name -> original name
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    """Serialises agent work; also lets eviction skip sessions in use."""
+    uploaded_bytes: int = 0
+    chat_times: deque = field(default_factory=deque)
+    last_used: float = field(default_factory=time.time)
 
 
 _SESSIONS: dict[str, Session] = {}
 _LOCK = threading.Lock()
+_CHAT_SEMAPHORE = threading.BoundedSemaphore(CHAT_CONCURRENCY)
 
 # LRU cache of finished analyses keyed by (size, mtime_ns) so re-analysing
 # the same file (chat tool call after a direct report, repeated questions)
@@ -85,13 +95,24 @@ def _cached_analyze(path: str, contour: bool) -> dict:
 def _get_session(session_id: str | None) -> tuple[str, Session]:
     with _LOCK:
         if session_id and session_id in _SESSIONS:
-            return session_id, _SESSIONS[session_id]
+            sess = _SESSIONS[session_id]
+            sess.last_used = time.time()
+            return session_id, sess
         sid = uuid.uuid4().hex
         _SESSIONS[sid] = Session()
-        while len(_SESSIONS) > MAX_SESSIONS:  # evict oldest sessions
-            oldest, sess = next(iter(_SESSIONS.items()))
-            shutil.rmtree(sess.upload_dir, ignore_errors=True)
-            del _SESSIONS[oldest]
+        if len(_SESSIONS) > MAX_SESSIONS:  # evict least-recently-used idle sessions
+            candidates = sorted(_SESSIONS.items(), key=lambda kv: kv[1].last_used)
+            need = len(_SESSIONS) - MAX_SESSIONS
+            for old_sid, old_sess in candidates:
+                if need <= 0:
+                    break
+                if old_sess.lock.acquire(blocking=False):  # in use right now?
+                    try:
+                        shutil.rmtree(old_sess.upload_dir, ignore_errors=True)
+                        del _SESSIONS[old_sid]
+                        need -= 1
+                    finally:
+                        old_sess.lock.release()
         return sid, _SESSIONS[sid]
 
 
@@ -168,10 +189,17 @@ def upload():
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in ALLOWED_EXT:
         return jsonify(error=f"不支持的格式 {ext or '(无扩展名)'}，请上传 wav/mp3/flac/ogg"), 400
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(f.filename))
-    stored = f"{uuid.uuid4().hex[:8]}_{safe}"
-    f.save(os.path.join(sess.upload_dir, stored))
-    sess.files[stored] = f.filename
+    f.stream.seek(0, 2)
+    size = f.stream.tell()
+    f.stream.seek(0)
+    with sess.lock:
+        if sess.uploaded_bytes + size > SESSION_UPLOAD_QUOTA:
+            return jsonify(error="本会话上传总量已达上限（200 MB），请开新对话"), 413
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(f.filename))
+        stored = f"{uuid.uuid4().hex[:8]}_{safe}"
+        f.save(os.path.join(sess.upload_dir, stored))
+        sess.files[stored] = f.filename
+        sess.uploaded_bytes += size
     return jsonify(session_id=sid, stored=stored, original=f.filename)
 
 
@@ -183,8 +211,20 @@ def chat():
     sid, sess = _get_session(body.get("session_id"))
     if not message and not attached:
         return jsonify(error="消息为空"), 400
+
+    # per-session rate limit (sliding window)
+    max_calls, window_s = CHAT_RATE_LIMIT
+    now = time.time()
+    with sess.lock:
+        while sess.chat_times and now - sess.chat_times[0] > window_s:
+            sess.chat_times.popleft()
+        if len(sess.chat_times) >= max_calls:
+            return jsonify(error="请求太频繁，请稍后再试"), 429
+        sess.chat_times.append(now)
+
     try:
-        agent = _get_or_build_agent(sess, body)
+        with sess.lock:
+            agent = _get_or_build_agent(sess, body)
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 400
 
@@ -202,7 +242,8 @@ def chat():
         message = "请分析我上传的音频。"
 
     try:
-        answer = agent.ask(message)
+        with sess.lock, _CHAT_SEMAPHORE:
+            answer = agent.ask(message)
     except Exception as exc:  # noqa: BLE001 — surface as a chat error
         return jsonify(error=f"请求失败：{exc}"), 502
     return jsonify(session_id=sid, answer=answer)
@@ -237,11 +278,14 @@ def analyze_direct():
 def reset():
     body = request.get_json(force=True)
     sid, sess = _get_session(body.get("session_id"))
-    sess.agent = None
-    sess.config_key = ()
-    sess.files.clear()
-    for name in os.listdir(sess.upload_dir):
-        os.remove(os.path.join(sess.upload_dir, name))
+    with sess.lock:
+        sess.agent = None
+        sess.config_key = ()
+        sess.files.clear()
+        sess.uploaded_bytes = 0
+        sess.chat_times.clear()
+        for name in os.listdir(sess.upload_dir):
+            os.remove(os.path.join(sess.upload_dir, name))
     return jsonify(session_id=sid, ok=True)
 
 

@@ -866,13 +866,32 @@ function stopRecording() {
 function downsampleTo16k(buf, from) {
   const to = 16000;
   if (from === to) return buf;
-  const ratio = from / to, n = Math.floor(buf.length / ratio);
+  if (from < to) return buf; // upsampling not expected for mics
+  const ratio = from / to;
+  // anti-alias: windowed-sinc low-pass just below the target Nyquist (8 kHz)
+  // before decimation — plain box-averaging folds HF energy into the voice band
+  const cutoff = 0.42 / ratio;                 // normalised (Nyquist = 1.0)
+  const taps = 33;
+  const h = new Float32Array(taps);
+  const mid = (taps - 1) / 2;
+  let hsum = 0;
+  for (let i = 0; i < taps; i++) {
+    const t = (i - mid) / taps;
+    const sinc = 2 * cutoff * (Math.abs(t) < 1e-9 ? 1 : Math.sin(Math.PI * 2 * cutoff * (i - mid)) / (Math.PI * (i - mid)));
+    h[i] = sinc * (0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (taps - 1))); // Hamming
+    hsum += h[i];
+  }
+  for (let i = 0; i < taps; i++) h[i] /= hsum;
+  const n = Math.floor(buf.length / ratio);
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    const i0 = Math.floor(i * ratio), i1 = Math.max(Math.floor((i + 1) * ratio), i0 + 1);
+    const c = Math.round(i * ratio);
     let s = 0;
-    for (let j = i0; j < i1; j++) s += buf[j] || 0;
-    out[i] = s / (i1 - i0);
+    for (let j = 0; j < taps; j++) {
+      const k = c - mid + j;
+      if (k >= 0 && k < buf.length) s += h[j] * buf[k];
+    }
+    out[i] = s;
   }
   return out;
 }

@@ -15,10 +15,12 @@ Configuration (environment variables):
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -73,6 +75,8 @@ class AgentConfig:
     """Retries (beyond the first attempt) for transient transport errors."""
     retry_backoff_s: float = 1.0
     """Base backoff delay; doubles after each failed attempt."""
+    max_history_chars: int = 40_000
+    """Rough history budget: older messages are dropped to stay under it."""
 
     def validate(self) -> None:
         if not self.api_key:
@@ -105,6 +109,17 @@ def build_tool_specs() -> list[dict]:
     ]
 
 
+def _sanitize(obj: Any) -> Any:
+    """Replace NaN/Inf floats with None so results stay valid strict JSON."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+
 def _safe_json(obj: Any) -> str:
     def default(o: Any) -> str:
         try:
@@ -112,7 +127,8 @@ def _safe_json(obj: Any) -> str:
         except Exception:  # noqa: BLE001 — last-resort stringification
             return "<unserialisable>"
 
-    return json.dumps(obj, ensure_ascii=False, default=default)
+    return json.dumps(_sanitize(obj), ensure_ascii=False, default=default,
+                      allow_nan=False)
 
 
 #: HTTP status codes worth retrying: request timeout, rate limit, server errors
@@ -130,7 +146,7 @@ class SpeechResearchAgent:
         self.tools = tools if tools is not None else self.default_tools()
         self.tool_specs = build_tool_specs()
         self.history: list[dict] = []
-        self._tool_cache: dict[str, str] = {}
+        self._tool_cache: OrderedDict[str, str] = OrderedDict()
 
     # ------------------------------------------------------------------
     # local tools the model can call
@@ -191,6 +207,34 @@ class SpeechResearchAgent:
         self.history = []
         self._tool_cache.clear()
 
+    def _trim_history(self, messages: list[dict]) -> list[dict]:
+        """Keep the system message + the newest messages within the budget.
+
+        Trim points never split an assistant/tool call exchange: cutting at a
+        ``role == "user"`` boundary keeps the remaining sequence valid.
+        """
+        budget = self.config.max_history_chars
+        total = sum(len(str(m.get("content") or "")) for m in messages)
+        if total <= budget or len(messages) <= 2:
+            return messages
+        system, rest = messages[0], messages[1:]
+        acc = len(str(system.get("content") or ""))
+        # walk from the newest message backwards, stop at a user turn once
+        # we are over budget
+        keep_from = len(rest)
+        running = 0
+        for i in range(len(rest) - 1, -1, -1):
+            running += len(str(rest[i].get("content") or ""))
+            if running + acc > budget and rest[i].get("role") == "user" and i + 1 < len(rest):
+                keep_from = i
+                break
+            keep_from = i
+        trimmed = [system] + rest[keep_from:]
+        # last resort: even a single exchange is too big — keep just the tail
+        if sum(len(str(m.get("content") or "")) for m in trimmed) > budget * 1.5:
+            return [system, rest[-1]]
+        return trimmed
+
     def ask(self, question: str, context: dict | None = None) -> str:
         """Ask a research question; returns the assistant's final answer.
 
@@ -231,11 +275,19 @@ class SpeechResearchAgent:
                 continue
 
             messages.append({"role": "assistant", "content": msg.get("content", "")})
-            self.history = messages
+            self.history = self._trim_history(messages)
             return msg.get("content", "")
 
-        self.history = messages
-        return "(reached the tool-call round limit without a final answer)"
+        # round limit reached without a final answer: close the exchange with
+        # a synthetic assistant message so the history stays a valid
+        # user/assistant alternation for the next turn
+        notice = (
+            "（已达到工具调用轮数上限，本次未能给出最终结论。"
+            "请尝试缩小问题范围，或直接运行 speechlab analyze 查看原始数据。）"
+        )
+        messages.append({"role": "assistant", "content": notice})
+        self.history = self._trim_history(messages)
+        return notice
 
     @staticmethod
     def _assistant_message(msg: dict) -> dict:
@@ -262,6 +314,7 @@ class SpeechResearchAgent:
         cache_key = f"{name}:{raw_args}"
         cached = self._tool_cache.get(cache_key)
         if cached is not None:
+            self._tool_cache.move_to_end(cache_key)
             return cached
 
         try:
@@ -276,7 +329,7 @@ class SpeechResearchAgent:
         except Exception as exc:  # noqa: BLE001 — surface tool errors to the model
             return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
 
-        if len(self._tool_cache) >= 64:
-            self._tool_cache.clear()
+        while len(self._tool_cache) >= 64:
+            self._tool_cache.popitem(last=False)
         self._tool_cache[cache_key] = out
         return out

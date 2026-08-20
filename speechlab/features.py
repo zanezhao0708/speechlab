@@ -416,8 +416,17 @@ def recording_quality(samples: np.ndarray, sr: int) -> dict:
     peak = float(np.max(np.abs(x))) if len(x) else 0.0
     peak_db = float(db(peak ** 2)) if peak > 0 else -120.0
 
-    # clipping: samples pinned at (or within 0.1 % of) full scale
-    clip_ratio = float(np.mean(np.abs(x) >= 0.999)) if len(x) else 0.0
+    # clipping: only *runs* of consecutive samples pinned at full scale count —
+    # a lone peak sample (e.g. from lossless normalisation) is not clipping
+    at_peak = np.abs(x) >= 0.999 if len(x) else np.zeros(0, dtype=bool)
+    clip_samples = 0
+    if at_peak.any():
+        edges = np.diff(np.concatenate(([False], at_peak, [False])).astype(np.int8))
+        starts, ends = np.where(edges == 1)[0], np.where(edges == -1)[0]
+        run_lens = ends - starts
+        clip_samples = int(run_lens[run_lens >= 3].sum())
+    clip_ratio = clip_samples / len(x) if len(x) else 0.0
+    clipping = clip_samples > 0
 
     frame_length, hop_length = default_frame_lengths(sr)
     frames = frame_signal(x, frame_length, hop_length, window="rect", center=True)
@@ -436,7 +445,7 @@ def recording_quality(samples: np.ndarray, sr: int) -> dict:
     if len(x) == 0:
         issues.append("empty file")
     else:
-        if peak >= 0.999:
+        if clipping:
             issues.append("clipping detected — re-record at lower gain")
         if peak_db < -30.0:
             issues.append("recording too quiet — check microphone/gain")
@@ -501,6 +510,7 @@ def spectrogram(samples: np.ndarray, sr: int, max_time_bins: int = 120,
     keep = freqs <= fmax_hz
     spec, freqs = spec[:, keep], freqs[keep]
     spec_db = db(spec.T)  # (freq_bins, time_bins)
+    n_frames_total = spec_db.shape[1]
 
     # block-average to the target resolution
     def _pool(a: np.ndarray, axis: int, target: int) -> np.ndarray:
@@ -514,10 +524,13 @@ def spectrogram(samples: np.ndarray, sr: int, max_time_bins: int = 120,
         a = a[tuple(sl)]
         return a.reshape(*a.shape[:axis], -1, size, *a.shape[axis + 1:]).mean(axis=axis + 1)
 
-    spec_db = _pool(spec_db, 1, max_time_bins)
+    spec_db = _pool(spec_db, 0, max_freq_bins)   # pool frequency rows …
+    spec_db = _pool(spec_db, 1, max_time_bins)   # … and time columns
     freqs = _pool(freqs, 0, max_freq_bins)
 
-    times = (np.arange(spec_db.shape[1]) + 0.5) * hop_length / sr
+    # pooled bins each cover n_frames_total/cols frames of hop_length/sr
+    bin_span_s = n_frames_total * hop_length / sr / spec_db.shape[1]
+    times = (np.arange(spec_db.shape[1]) + 0.5) * bin_span_s
     return {
         "t_max": round(float(len(x) / sr), 3),
         "times_s": [round(float(t), 3) for t in times],
@@ -611,7 +624,21 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
     # pitch is the most expensive stage — compute once and share it with
     # the jitter/shimmer and HNR estimators
     track = f0_track(x, sr)
-    js = jitter_shimmer(x, sr, track=track)
+    segs = voiced_segments(track)
+    if segs:
+        # clinical perturbation measures assume a sustained vowel: prefer the
+        # longest contiguous voiced stretch over the whole (possibly
+        # connected-speech) recording
+        seg = max(segs, key=lambda s: s["end_s"] - s["start_s"])
+        i0, i1 = int(seg["start_s"] * sr), min(int(seg["end_s"] * sr) + 1, len(x))
+        sub_x = x[i0:i1]
+        m = (track.times >= seg["start_s"]) & (track.times <= seg["end_s"])
+        sub_track = F0Track(times=track.times[m], f0=track.f0[m], voiced=track.voiced[m])
+        js = jitter_shimmer(sub_x, sr, track=sub_track)
+        js_segment = seg
+    else:
+        js = jitter_shimmer(x, sr, track=track)
+        js_segment = None
     fl, hl = default_frame_lengths(sr)
     # median formants over the most energetic voiced frames
     frames = frame_signal(x, fl, hl, window="rect", center=True)
@@ -636,6 +663,8 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
         "n_samples": int(audio.num_samples),
         "pitch": track.summary(),
         "voice_quality": js.summary(),
+        "voice_quality_segment_s": (js_segment["start_s"], js_segment["end_s"])
+                                   if js_segment else None,
         "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
         "formants": formant_summary,
         "recording_quality": recording_quality(x, sr),
