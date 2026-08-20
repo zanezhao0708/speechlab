@@ -235,6 +235,28 @@
   .key-status { font-size: 12px; margin-bottom: 14px; }
   .key-status.ok { color: var(--ok); }
   .key-status.warn { color: #f0b429; }
+
+  /* history modal items */
+  #history-list { max-height: 50vh; overflow-y: auto; }
+  .hist-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 6px; cursor: pointer;
+  }
+  .hist-item:hover { border-color: var(--accent); }
+  .hist-title { font-size: 13px; max-width: 280px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .hist-del { background: none; border: none; cursor: pointer; font-size: 14px;
+    color: var(--muted); }
+  .hist-del:hover { color: var(--danger); }
+
+  /* live streaming + tool status */
+  .tool-status { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .tool-status.done { color: var(--ok); }
+  .cursor-blink { display: inline-block; width: 7px; height: 14px;
+    background: var(--accent); vertical-align: -2px; margin-left: 2px;
+    animation: recpulse 1s infinite; }
 </style>
 </head>
 <body>
@@ -249,7 +271,8 @@
   </div>
   <div class="header-actions">
     <button class="btn" id="btn-analyze" title="上传音频直接做声学分析（无需 API Key）">📊 直接分析</button>
-    <button class="btn" id="btn-trend" title="历史测量趋势（治疗前后对比）">📈 趋势</button>
+    <button class="btn" id="btn-trend" title="历史测量趋势（治疗前后对比，跨设备同步）">📈 趋势</button>
+    <button class="btn" id="btn-history" title="历史对话（跨设备恢复）">🕘 历史</button>
     <button class="btn" id="btn-reset">🗑️ 新对话</button>
     <button class="btn" id="btn-settings">⚙️ 设置</button>
   </div>
@@ -289,11 +312,36 @@
 
 <div class="modal-bg" id="trend-modal">
   <div class="modal">
-    <h3>📈 测量趋势（本机保存）</h3>
+    <h3>📈 测量趋势（本机 + 服务器跨设备同步）</h3>
     <div id="trend-body"></div>
     <div class="modal-actions" style="margin-top:12px">
       <button class="btn" id="trend-clear">🗑️ 清空历史</button>
       <button class="btn primary" id="trend-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="history-modal">
+  <div class="modal">
+    <h3>🕘 历史对话</h3>
+    <p>对话自动保存在服务器上，同一浏览器身份可在任何设备恢复查看。</p>
+    <div id="history-list"></div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn primary" id="history-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="auth-modal">
+  <div class="modal">
+    <h3>🔒 需要访问密码</h3>
+    <p>本服务器开启了访问保护，请输入访问密码（仅保存在你的浏览器本地）。</p>
+    <div class="field">
+      <label>访问密码</label>
+      <input type="password" id="auth-pass" placeholder="访问密码">
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="auth-save">进入</button>
     </div>
   </div>
 </div>
@@ -325,8 +373,42 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let sessionId = null;
-let pendingFiles = [];   // [{stored, original}]
+let conversationId = null;   // server-side persisted conversation
+let pendingFiles = [];       // [{stored, original}]
 let busy = false;
+
+// ---------- identity / auth ----------
+// Anonymous browser identity: lets the server group conversations and
+// measurements so history/trends follow the user across devices.
+function getUserKey() {
+  let k = localStorage.getItem("sl_user");
+  if (!k) {
+    k = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+    localStorage.setItem("sl_user", k);
+  }
+  return k;
+}
+function authToken() { return localStorage.getItem("sl_auth") || ""; }
+function apiHeaders(json = false) {
+  const h = { "X-User-Key": getUserKey() };
+  if (authToken()) h["X-Auth-Token"] = authToken();
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+function requireAuth() {
+  if (authToken()) return false;
+  $("auth-modal").classList.add("open");
+  $("auth-pass").focus();
+  return true;
+}
+$("auth-save").onclick = () => {
+  localStorage.setItem("sl_auth", $("auth-pass").value);
+  $("auth-modal").classList.remove("open");
+  location.reload();
+};
+$("auth-pass").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("auth-save").click();
+});
 
 // ---------- settings ----------
 const cfg = {
@@ -339,6 +421,7 @@ async function loadServerConfig() {
   try {
     const r = await fetch("/api/config");
     const d = await r.json();
+    if (d.auth_required) requireAuth();
     const el = $("key-status");
     if (d.has_server_key) {
       el.textContent = "✓ 服务器已配置 API Key，可直接使用（也可在下方覆盖）";
@@ -490,7 +573,8 @@ async function uploadFile(file) {
   fd.append("file", file);
   if (sessionId) fd.append("session_id", sessionId);
   try {
-    const r = await fetch("/api/upload", { method: "POST", body: fd });
+    const r = await fetch("/api/upload", { method: "POST", body: fd, headers: apiHeaders() });
+    if (r.status === 401) { requireAuth(); return; }
     const d = await r.json();
     if (!r.ok) { addMessage("error", d.error || "上传失败"); return; }
     sessionId = d.session_id;
@@ -518,7 +602,24 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 }
 
-// ---------- send ----------
+// ---------- send (SSE streaming) ----------
+function liveBubble() {
+  removeTyping();
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const tools = document.createElement("div");
+  const mdc = document.createElement("div");
+  bubble.appendChild(tools);
+  bubble.appendChild(mdc);
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  scrollBottom();
+  return { bubble, tools, mdc };
+}
+
 async function send(text) {
   if (busy) return;
   const message = (text ?? $("input").value).trim();
@@ -534,28 +635,77 @@ async function send(text) {
   renderPending();
   addTyping();
 
+  let live = null, acc = "";
   try {
-    const r = await fetch("/api/chat", {
+    const res = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: apiHeaders(true),
       body: JSON.stringify({
         message, attached,
-        session_id: sessionId,
+        session_id: sessionId, conversation_id: conversationId,
         api_key: cfg.key, base_url: cfg.url, model: cfg.model,
       }),
     });
-    const d = await r.json();
-    removeTyping();
-    if (!r.ok) {
-      addMessage("error", d.error || "请求失败");
-      if (String(d.error || "").includes("API Key")) $("settings-modal").classList.add("open");
-    } else {
-      sessionId = d.session_id;
-      addMessage("bot", d.answer);
+    if (res.status === 401) { removeTyping(); requireAuth(); return; }
+    if (!res.ok || !res.body) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const handleEvent = (ev) => {
+      if (ev.type === "meta") {
+        sessionId = ev.session_id || sessionId;
+        conversationId = ev.conversation_id || conversationId;
+      } else if (ev.type === "delta") {
+        if (!live) live = liveBubble();
+        acc += ev.text || "";
+        live.mdc.innerHTML = mdToHtml(acc) + '<span class="cursor-blink"></span>';
+        scrollBottom();
+      } else if (ev.type === "tool") {
+        if (!live) live = liveBubble();
+        if (ev.status === "start") {
+          const row = document.createElement("div");
+          row.className = "tool-status";
+          row.textContent = `🔧 调用 ${ev.name} …`;
+          live.tools.appendChild(row);
+        } else {
+          const open = live.tools.querySelectorAll(".tool-status:not(.done)");
+          if (open.length) {
+            open[open.length - 1].classList.add("done");
+            open[open.length - 1].textContent = `🔧 ${ev.name} ✓`;
+          }
+        }
+      } else if (ev.type === "done") {
+        removeTyping();
+        if (live) live.mdc.innerHTML = mdToHtml(ev.answer || acc);
+        else addMessage("bot", ev.answer || acc);
+        scrollBottom();
+      } else if (ev.type === "error") {
+        removeTyping();
+        if (live) live.mdc.innerHTML = mdToHtml(acc || "");
+        addMessage("error", ev.error || "请求失败");
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const line = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        try { handleEvent(JSON.parse(line.slice(5).trim())); } catch (e) { /* skip */ }
+      }
     }
   } catch (err) {
     removeTyping();
-    addMessage("error", "网络错误：" + err);
+    addMessage("error", "网络错误：" + (err.message || err));
   } finally {
     busy = false;
     $("send").disabled = false;
@@ -587,15 +737,91 @@ document.querySelectorAll(".suggestion").forEach((el) => {
 $("btn-reset").onclick = async () => {
   if (sessionId) {
     try { await fetch("/api/reset", {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST", headers: apiHeaders(true),
       body: JSON.stringify({ session_id: sessionId }) }); } catch (e) {}
   }
   sessionId = null;
+  conversationId = null;
   pendingFiles = [];
   renderPending();
   $("messages").innerHTML = "";
   location.reload();
 };
+
+// ---------- history (server-side conversations) ----------
+$("btn-history").onclick = async () => {
+  await loadHistoryList();
+  $("history-modal").classList.add("open");
+};
+$("history-close").onclick = () => $("history-modal").classList.remove("open");
+$("history-modal").onclick = (e) => {
+  if (e.target === $("history-modal")) $("history-modal").classList.remove("open");
+};
+
+async function loadHistoryList() {
+  const box = $("history-list");
+  box.innerHTML = '<p style="color:var(--muted)">加载中…</p>';
+  try {
+    const r = await fetch("/api/history", { headers: apiHeaders() });
+    if (r.status === 401) { requireAuth(); return; }
+    const d = await r.json();
+    const list = d.conversations || [];
+    if (!list.length) {
+      box.innerHTML = '<p style="color:var(--muted)">暂无历史对话。开始聊天后会自动保存。</p>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const c of list) {
+      const item = document.createElement("div");
+      item.className = "hist-item";
+      const left = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "hist-title";
+      title.textContent = c.title || "(无标题)";
+      const time = document.createElement("div");
+      time.className = "hist-time";
+      time.textContent = new Date((c.updated_at || 0) * 1000).toLocaleString();
+      left.appendChild(title); left.appendChild(time);
+      const del = document.createElement("button");
+      del.className = "hist-del";
+      del.textContent = "🗑️";
+      del.title = "删除该对话";
+      del.onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          await fetch("/api/history", {
+            method: "DELETE", headers: apiHeaders(true),
+            body: JSON.stringify({ conversation_id: c.id }) });
+        } catch (err) { /* noop */ }
+        loadHistoryList();
+      };
+      item.appendChild(left); item.appendChild(del);
+      item.onclick = () => openConversation(c.id);
+      box.appendChild(item);
+    }
+  } catch (e) {
+    box.innerHTML = '<p style="color:var(--danger)">加载失败：' + escapeHtml(String(e)) + '</p>';
+  }
+}
+
+async function openConversation(id) {
+  try {
+    const r = await fetch(`/api/history?conversation_id=${encodeURIComponent(id)}`,
+      { headers: apiHeaders() });
+    const d = await r.json();
+    if (!r.ok) { addMessage("error", d.error || "加载失败"); return; }
+    $("history-modal").classList.remove("open");
+    $("messages").innerHTML = "";
+    conversationId = id;
+    for (const m of d.messages || []) {
+      if (m.role === "user") addMessage("user", m.content, m.files || []);
+      else if (m.role === "assistant") addMessage("bot", m.content);
+    }
+    if (!(d.messages || []).length) addMessage("bot", "（该对话没有消息）");
+  } catch (e) {
+    addMessage("error", "加载失败：" + e);
+  }
+}
 
 // ---------- direct analysis (no API key) ----------
 $("btn-analyze").onclick = () => $("analyze-input").click();
@@ -613,7 +839,7 @@ async function analyzeFiles(files, fromRecord) {
     const results = await Promise.all(files.map(async (file) => {
       const fd = new FormData();
       fd.append("file", file);
-      const r = await fetch("/api/analyze", { method: "POST", body: fd });
+      const r = await fetch("/api/analyze", { method: "POST", body: fd, headers: apiHeaders() });
       return { file, d: await r.json(), ok: r.ok };
     }));
     const reports = [];
@@ -968,18 +1194,43 @@ function saveTrend(r) {
 }
 $("btn-trend").onclick = () => { renderTrend(); $("trend-modal").classList.add("open"); };
 $("trend-close").onclick = () => $("trend-modal").classList.remove("open");
-$("trend-clear").onclick = () => {
-  if (confirm("清空本机保存的全部测量历史？")) {
-    localStorage.removeItem("sl_trends");
-    renderTrend();
-  }
+$("trend-clear").onclick = async () => {
+  if (!confirm("清空本机与服务器上保存的全部测量历史？")) return;
+  localStorage.removeItem("sl_trends");
+  try { await fetch("/api/trends", { method: "DELETE", headers: apiHeaders() }); } catch (e) { /* noop */ }
+  renderTrend();
 };
-function renderTrend() {
+
+async function fetchTrendList() {
+  // local (this browser) + server (this user key, any device), deduped
+  let local = [];
+  try { local = JSON.parse(localStorage.getItem("sl_trends") || "[]"); } catch (e) { /* noop */ }
+  let server = [];
+  try {
+    const r = await fetch("/api/trends", { headers: apiHeaders() });
+    const d = await r.json();
+    server = (d.measurements || []).map((m) => ({
+      ts: (m.ts || 0) * 1000, file: m.file || "—", src: "server",
+      f0: m.f0, jitter: m.jitter, shimmer: m.shimmer, hnr: m.hnr,
+    }));
+  } catch (e) { /* server unreachable → local only */ }
+  const seen = new Set();
+  const merged = [];
+  for (const e of [...local.map((x) => ({ ...x, src: x.src || "local" })), ...server]) {
+    const key = `${Math.round((e.ts || 0) / 1000)}|${e.file}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(e);
+  }
+  merged.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return merged;
+}
+
+async function renderTrend() {
   const body = $("trend-body");
-  let list = [];
-  try { list = JSON.parse(localStorage.getItem("sl_trends") || "[]"); } catch (e) { /* noop */ }
+  const list = await fetchTrendList();
   if (!list.length) {
-    body.innerHTML = '<p style="color:var(--muted)">还没有历史测量。用 📊 分析或 🎤 录音后，结果会自动记录在这里，适合追踪治疗/训练前后的变化。</p>';
+    body.innerHTML = '<p style="color:var(--muted)">还没有历史测量。用 📊 分析或 🎤 录音后，结果会自动记录并跨设备同步，适合追踪治疗/训练前后的变化。</p>';
     return;
   }
   const metrics = [

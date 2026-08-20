@@ -38,7 +38,8 @@ class _FakeResponse:
 def test_tool_specs_valid():
     specs = build_tool_specs()
     names = {s["function"]["name"] for s in specs}
-    assert names == {"analyze_audio"}
+    assert names == {"analyze_audio", "compare_audio", "diarize_audio",
+                     "transcribe_audio", "reference_ranges"}
     for s in specs:
         assert s["type"] == "function"
         json.dumps(s)  # serialisable

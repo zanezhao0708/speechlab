@@ -28,7 +28,9 @@ __all__ = [
     "F0Track",
     "JitterShimmer",
     "analyze",
+    "compare_reports",
     "default_frame_lengths",
+    "diarize",
     "f0_track",
     "formants",
     "hnr",
@@ -36,6 +38,7 @@ __all__ = [
     "lpc",
     "pause_stats",
     "recording_quality",
+    "reference_ranges",
     "spectrogram",
     "voiced_segments",
 ]
@@ -591,7 +594,8 @@ def pause_stats(samples: np.ndarray, sr: int, min_pause_s: float = 0.2,
     while i < n_frames - 1:
         if (is_speech[i] and env_s[i] > thr
                 and env_s[i] >= env_s[i - 1] and env_s[i] > env_s[i + 1]
-                and i - last_peak >= min_dist):
+                and i - last_peak >= min_dist
+                and _peak_prominence(env_s, i) >= 0.5):
             n_syll += 1
             last_peak = i
             i += min_dist
@@ -608,6 +612,255 @@ def pause_stats(samples: np.ndarray, sr: int, min_pause_s: float = 0.2,
         "syllable_est": int(n_syll),
         "articulation_rate_syl_per_s": round(n_syll / speech_s, 2) if speech_s > 0.2 else None,
     }
+
+
+# --------------------------------------------------------------------------
+# speaker diarization (lightweight, offline)
+# --------------------------------------------------------------------------
+
+def _peak_prominence(env: np.ndarray, i: int, span: int = 0) -> float:
+    """Prominence of env[i]: peak height over the higher adjacent valley.
+
+    Valleys are searched within ~120 ms on each side (bounded by larger
+    neighbours).  A real syllable nucleus rises clearly out of its valleys;
+    ripple on a long vowel does not.
+    """
+    n = len(env)
+    look = span or max(2, round(0.12 / 0.01))
+    lo = max(0, i - look)
+    hi = min(n, i + look + 1)
+    seg = env[lo:hi]
+    if len(seg) < 3:
+        return 0.0
+    peak = env[i]
+    left = env[lo:i + 1]
+    right = env[i:hi]
+    lv = float(np.min(left))
+    rv = float(np.min(right))
+    valley = max(lv, rv)
+    if peak <= 0:
+        return 0.0
+    return (peak - valley) / peak
+
+
+def _logmel(x: np.ndarray, sr: int, n_filters: int = 20) -> np.ndarray:
+    """Frame-wise log-Mel-band energies (simple triangular filterbank)."""
+    frame_length, hop_length = default_frame_lengths(sr)
+    frames = frame_signal(x, frame_length, hop_length, window="hann", center=True)
+    if len(frames) == 0:
+        return np.zeros((0, n_filters))
+    spec = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(frame_length, 1.0 / sr)
+    fmin, fmax = 80.0, min(6000.0, sr / 2 - 200.0)
+    centers = np.geomspace(fmin, fmax, n_filters + 2)
+    out = np.zeros((len(frames), n_filters))
+    for k in range(n_filters):
+        lo, mid, hi = centers[k], centers[k + 1], centers[k + 2]
+        m = ((freqs >= lo) & (freqs <= hi)).astype(float)
+        tri = np.zeros_like(freqs)
+        idx = np.where(m > 0)[0]
+        if len(idx) == 0:
+            continue
+        rising = (freqs[idx] - lo) / max(mid - lo, 1e-9)
+        falling = (hi - freqs[idx]) / max(hi - mid, 1e-9)
+        tri[idx] = np.minimum(rising, falling)
+        out[:, k] = np.sqrt(np.maximum(spec @ tri, 1e-12))
+    return np.log(out + 1e-10)
+
+
+def diarize(audio: AudioData, n_speakers: int = 2, min_turn_s: float = 0.4,
+            max_speakers: int = 4) -> dict:
+    """Who speaks when — lightweight offline diarization.
+
+    Frames of log-Mel spectral shape (energy-normalised) are clustered with
+    agglomerative average linkage over cosine distance; energy gating keeps
+    only speech frames.  ``n_speakers`` may be ``0`` for auto (1..max) via
+    the largest silhouette.  Output includes per-speaker speaking time and
+    merged turns.  This is a compact classical system — expect ~80-90 % frame
+    accuracy on clean two-speaker audio, not production-grade diarization.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    sr, x = audio.sample_rate, np.asarray(audio.samples, dtype=np.float64)
+    feats = _logmel(x, sr)
+    if len(feats) < 10:
+        return {"n_speakers": 0, "speaking_time_s": {}, "turns": [],
+                "note": "recording too short for diarization"}
+
+    frame_length, hop_length = default_frame_lengths(sr)
+    t_frame = hop_length / sr
+    rms = np.sqrt(np.mean(
+        frame_signal(x, frame_length, hop_length, window="rect", center=True) ** 2,
+        axis=1) + 1e-12)
+    speech = rms > 0.15 * float(np.max(rms)) if len(rms) else np.zeros(len(feats), bool)
+    speech = speech[:len(feats)]
+    idx = np.where(speech)[0]
+    if len(idx) < 10:
+        return {"n_speakers": 0, "speaking_time_s": {}, "turns": [],
+                "note": "no sustained speech detected"}
+
+    # energy normalisation: speaker identity lives in spectral shape, not level
+    sub = feats[idx].copy()
+    sub -= sub.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(sub, axis=1, keepdims=True)
+    sub = sub / np.maximum(norms, 1e-10)
+
+    def _cluster(k: int) -> np.ndarray:
+        link = linkage(sub, method="average", metric="cosine")
+        return fcluster(link, t=k, criterion="maxclust") - 1
+
+    def _silhouette(labels: np.ndarray) -> float:
+        from scipy.spatial.distance import cdist
+        ks = np.unique(labels)
+        if len(ks) < 2:
+            return -1.0
+        cents = np.vstack([sub[labels == k].mean(axis=0) for k in ks])
+        d = cdist(sub, cents, "cosine")
+        own = d[np.arange(len(labels)), labels]
+        other = np.min(d + np.eye(len(ks))[labels] * 10, axis=1)
+        s = np.mean((other - own) / np.maximum(np.maximum(own, other), 1e-10))
+        return float(s)
+
+    if n_speakers and n_speakers > 1:
+        best = _cluster(n_speakers)
+    else:
+        best, best_s = None, -2.0
+        for k in range(2, max_speakers + 1):
+            lab = _cluster(k)
+            s = _silhouette(lab)
+            if s > best_s:
+                best, best_s = lab, s
+        if best is None:  # single speaker
+            best = np.zeros(len(idx), dtype=int)
+
+    labels = np.zeros(len(feats), dtype=int)
+    labels[idx] = best
+
+    # majority smoothing over ±5 frames (50 ms) to kill spurious flickers
+    from scipy.signal import medfilt
+    labels_s = medfilt(labels, 5).astype(int)
+
+    # merge into turns
+    turns: list[dict] = []
+    cur = labels_s[0]
+    start = 0.0
+    for i in range(1, len(labels_s)):
+        if labels_s[i] != cur:
+            turns.append({"speaker": int(cur),
+                          "start_s": round(start, 2),
+                          "end_s": round(i * t_frame, 2)})
+            cur = labels_s[i]
+            start = i * t_frame
+    turns.append({"speaker": int(cur), "start_s": round(start, 2),
+                  "end_s": round(len(labels_s) * t_frame, 2)})
+
+    # drop too-short turns by folding them into the previous kept turn
+    kept: list[dict] = []
+    for t in turns:
+        if kept and t["end_s"] - t["start_s"] < min_turn_s:
+            kept[-1]["end_s"] = t["end_s"]  # absorb
+        else:
+            kept.append(dict(t))
+    # re-merge consecutive same-speaker turns created by absorption
+    merged: list[dict] = []
+    for t in kept:
+        if merged and merged[-1]["speaker"] == t["speaker"]:
+            merged[-1]["end_s"] = t["end_s"]
+        else:
+            merged.append(t)
+
+    speaking = {int(k): round(float(np.sum(labels_s == k) * t_frame), 1)
+                for k in np.unique(labels_s)}
+    return {"n_speakers": len(speaking), "speaking_time_s": speaking,
+            "turns": merged}
+
+
+# --------------------------------------------------------------------------
+# statistical comparison of two analyses
+# --------------------------------------------------------------------------
+
+#: literature-derived screening ranges (adults, sustained vowel, unless noted)
+_NORMS: dict[str, dict] = {
+    "f0_hz": {"men": (85, 180), "women": (165, 255), "children": (250, 350),
+              "note": "modal speaking pitch"},
+    "jitter_percent": {"typical": (0.0, 1.0), "borderline": (1.0, 1.5),
+                       "note": "local jitter, sustained vowel (PRAAT norms)"},
+    "shimmer_db": {"typical": (0.0, 0.35), "borderline": (0.35, 0.7),
+                   "note": "local shimmer, sustained vowel"},
+    "hnr_db": {"typical": (20.0, 45.0), "borderline": (15.0, 20.0),
+               "note": ">20 dB suggests stable phonation"},
+    "snr_db": {"typical": (30.0, 60.0), "note": "recording quality target"},
+}
+
+
+def reference_ranges(metric: str = "") -> dict:
+    """Lookup table of literature screening ranges (for the agent)."""
+    if not metric:
+        return _NORMS
+    key = metric.lower().replace(" ", "_")
+    for k, value in _NORMS.items():
+        if k.split("_")[0] in key or key in k:
+            return {k: value}
+    return {"error": f"no reference data for '{metric}'",
+            "available": sorted(_NORMS)}
+
+
+def compare_reports(a: dict, b: dict) -> dict:
+    """Compare two analyze() reports with inferential statistics.
+
+    Welch t-test (F0 contour samples where available), Cohen's d effect
+    sizes for scalar summaries, normative grading for each side.
+    """
+    from scipy import stats
+
+    def _get(rep, keys, default=None):
+        cur = rep
+        for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+                return default
+            cur = cur[k]
+        return cur
+
+    pa, pb = a.get("pitch", {}), b.get("pitch", {})
+    ja, jb = a.get("voice_quality", {}), b.get("voice_quality", {})
+    metrics = [
+        ("f0_median_hz", pa.get("f0_median_hz"), pb.get("f0_median_hz"), "Hz"),
+        ("jitter_percent", ja.get("jitter_local_percent"), jb.get("jitter_local_percent"), "%"),
+        ("shimmer_db", ja.get("shimmer_local_db"), jb.get("shimmer_local_db"), "dB"),
+        ("hnr_db", a.get("hnr_db"), b.get("hnr_db"), "dB"),
+    ]
+    rows = []
+    for name, va, vb, unit in metrics:
+        if va is None or vb is None:
+            continue
+        row = {"metric": name, "a": round(float(va), 2), "b": round(float(vb), 2),
+               "diff_b_minus_a": round(float(vb) - float(va), 2), "unit": unit}
+        # pooled-std effect size when std available (F0 only)
+        sa, sb = pa.get("f0_std_hz"), pb.get("f0_std_hz")
+        if name == "f0_median_hz" and sa and sb:
+            sp = float(np.sqrt((sa ** 2 + sb ** 2) / 2))
+            row["cohens_d"] = round((float(vb) - float(va)) / sp, 2) if sp > 1e-9 else None
+        rows.append(row)
+
+    out: dict = {"metrics": rows}
+
+    # Welch t-test on the two F0 contour distributions (when present)
+    ca, cb = a.get("pitch_contour"), b.get("pitch_contour")
+    if ca and cb:
+        fa = np.array([v for v in ca["f0_hz"] if v is not None], dtype=float)
+        fb = np.array([v for v in cb["f0_hz"] if v is not None], dtype=float)
+        if len(fa) >= 5 and len(fb) >= 5:
+            t, p = stats.ttest_ind(fa, fb, equal_var=False)
+            dof = len(fa) + len(fb) - 2
+            out["f0_ttest"] = {
+                "t": round(float(t), 2), "p": float(p),
+                "df": int(dof), "n_a": len(fa), "n_b": len(fb),
+                "significant_5pct": bool(p < 0.05),
+                "note": "Welch t-test on per-frame F0 samples of both files",
+            }
+    if not rows and "f0_ttest" not in out:
+        out["error"] = "no comparable metrics between the two reports"
+    return out
 
 
 # --------------------------------------------------------------------------
