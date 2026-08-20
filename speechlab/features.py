@@ -34,6 +34,8 @@ __all__ = [
     "hnr",
     "jitter_shimmer",
     "lpc",
+    "recording_quality",
+    "voiced_segments",
 ]
 
 
@@ -398,11 +400,93 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
 
 
 # --------------------------------------------------------------------------
+# recording quality & segmentation
+# --------------------------------------------------------------------------
+
+def recording_quality(samples: np.ndarray, sr: int) -> dict:
+    """Pre-analysis recording checks researchers need before trusting numbers.
+
+    Returns peak level (dBFS), clipping ratio, broadband SNR estimate
+    (signal vs. quietest-10 % frames), and a list of issues that make the
+    recording unsuitable for perturbation measures.
+    """
+    x = np.asarray(samples, dtype=np.float64)
+    peak = float(np.max(np.abs(x))) if len(x) else 0.0
+    peak_db = float(db(peak ** 2)) if peak > 0 else -120.0
+
+    # clipping: samples pinned at (or within 0.1 % of) full scale
+    clip_ratio = float(np.mean(np.abs(x) >= 0.999)) if len(x) else 0.0
+
+    frame_length, hop_length = default_frame_lengths(sr)
+    frames = frame_signal(x, frame_length, hop_length, window="rect", center=True)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12) if len(frames) else np.empty(0)
+    if len(rms):
+        rms_db = db(rms ** 2)
+        noise_db = float(np.percentile(rms_db, 10))   # quietest frames ≈ noise floor
+        signal_db = float(np.percentile(rms_db, 90))  # energetic frames ≈ signal
+        # a sustained vowel / tone has no quiet gaps, so the percentile gap
+        # is tiny and the "noise floor" is meaningless — report unknown
+        snr_db = round(signal_db - noise_db, 1) if signal_db - noise_db >= 6.0 else float("nan")
+    else:
+        snr_db = float("nan")
+
+    issues = []
+    if len(x) == 0:
+        issues.append("empty file")
+    else:
+        if peak >= 0.999:
+            issues.append("clipping detected — re-record at lower gain")
+        if peak_db < -30.0:
+            issues.append("recording too quiet — check microphone/gain")
+        if np.isfinite(snr_db) and snr_db < 20.0:
+            issues.append("low SNR — perturbation measures unreliable")
+    return {
+        "peak_dbfs": round(peak_db, 1),
+        "clipping_ratio": round(clip_ratio, 5),
+        "snr_db": snr_db,
+        "issues": issues,
+    }
+
+
+def voiced_segments(track: F0Track, min_len_s: float = 0.3,
+                    max_gap_s: float = 0.1) -> list[dict]:
+    """Contiguous voiced stretches (e.g. sustained vowels) in a recording.
+
+    Merges voiced frames separated by gaps shorter than ``max_gap_s`` and
+    drops segments shorter than ``min_len_s``.  Useful for locating the
+    analysis-worthy parts of a long recording.
+    """
+    if len(track.times) == 0:
+        return []
+    segs: list[dict] = []
+    start: float | None = None
+    last: float = 0.0
+    for t, v in zip(track.times, track.voiced):
+        if v:
+            if start is None or t - last > max_gap_s:
+                if start is not None and last - start >= min_len_s:
+                    segs.append({"start_s": round(start, 3), "end_s": round(last, 3)})
+                start = t
+            last = t
+        elif start is not None and t - last > max_gap_s:
+            if last - start >= min_len_s:
+                segs.append({"start_s": round(start, 3), "end_s": round(last, 3)})
+            start = None
+    if start is not None and last - start >= min_len_s:
+        segs.append({"start_s": round(start, 3), "end_s": round(last, 3)})
+    return segs
+
+
+# --------------------------------------------------------------------------
 # the agent's tool entry point
 # --------------------------------------------------------------------------
 
-def analyze(audio: AudioData) -> dict:
-    """Run a standard acoustic analysis and return a JSON-ready dict."""
+def analyze(audio: AudioData, contour: bool = False) -> dict:
+    """Run a standard acoustic analysis and return a JSON-ready dict.
+
+    With ``contour=True`` a downsampled F0 track (``pitch_contour``) is
+    included for plotting.
+    """
     sr, x = audio.sample_rate, audio.samples
     # pitch is the most expensive stage — compute once and share it with
     # the jitter/shimmer and HNR estimators
@@ -425,7 +509,7 @@ def analyze(audio: AudioData) -> dict:
     else:
         formant_summary = {}
 
-    return {
+    report = {
         "file": audio.path,
         "duration_s": round(audio.duration, 3),
         "sample_rate_hz": sr,
@@ -434,4 +518,15 @@ def analyze(audio: AudioData) -> dict:
         "voice_quality": js.summary(),
         "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
         "formants": formant_summary,
+        "recording_quality": recording_quality(x, sr),
+        "voiced_segments": voiced_segments(track),
     }
+    if contour:
+        step = max(1, len(track.times) // 400)  # keep payloads small
+        idx = np.arange(0, len(track.times), step)
+        report["pitch_contour"] = {
+            "times_s": [round(float(t), 3) for t in track.times[idx]],
+            "f0_hz": [round(float(f), 1) if v else None
+                      for f, v in zip(track.f0[idx], track.voiced[idx])],
+        }
+    return report

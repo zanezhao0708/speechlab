@@ -63,6 +63,17 @@ def _get_session(session_id: str | None) -> tuple[str, Session]:
         return sid, _SESSIONS[sid]
 
 
+def _json_safe(obj):
+    """Replace NaN/Inf with None so the payload is strict JSON."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
+        return None
+    return obj
+
+
 def _make_tools(upload_dir: str) -> dict:
     """analyze_audio restricted to this session's uploaded files."""
 
@@ -180,13 +191,13 @@ def analyze_direct():
         path = os.path.join(tmpdir, safe)
         f.save(path)
         try:
-            report = analyze(load_audio(path))
+            report = analyze(load_audio(path), contour=True)
         except Exception as exc:  # noqa: BLE001 — report file/decoding problems
             return jsonify(error=f"分析失败：{exc}"), 400
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     report["file"] = f.filename
-    return jsonify(report)
+    return jsonify(_json_safe(report))
 
 
 @app.post("/api/reset")

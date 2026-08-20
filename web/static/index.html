@@ -106,6 +106,24 @@
   .bubble table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
   .bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 10px; }
   .bubble th { background: #262b3d; }
+
+  /* report extras: quality flags, compare table, contour chart */
+  .flags { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .flag {
+    border-radius: 6px; padding: 3px 10px; font-size: 12px;
+    background: #262b3d; color: var(--muted);
+  }
+  .flag.ok { color: var(--ok); }
+  .flag.warn { color: #f0b429; }
+  .flag.bad { color: var(--danger); }
+  .cmp-wrap { overflow-x: auto; margin: 8px 0; }
+  .cmp-wrap table { width: 100%; }
+  .cmp-wrap td, .cmp-wrap th { white-space: nowrap; }
+  .cmp-wrap td.best { color: var(--ok); font-weight: 600; }
+  .contour-box { margin: 10px 0 4px; }
+  .contour-box svg { width: 100%; height: auto; display: block;
+    background: #12141c; border: 1px solid var(--border); border-radius: 8px; }
+  .contour-title { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .msg.error .bubble { border-color: var(--danger); color: var(--danger); }
 
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -248,7 +266,7 @@
 </footer>
 
 <input type="file" id="file-input" accept=".wav,.wave,.mp3,.flac,.ogg,audio/*" multiple hidden>
-<input type="file" id="analyze-input" accept=".wav,.wave,.mp3,.flac,.ogg,audio/*" hidden>
+<input type="file" id="analyze-input" accept=".wav,.wave,.mp3,.flac,.ogg,audio/*" multiple hidden>
 
 <div class="modal-bg" id="settings-modal">
   <div class="modal">
@@ -552,28 +570,186 @@ $("btn-reset").onclick = async () => {
 // ---------- direct analysis (no API key) ----------
 $("btn-analyze").onclick = () => $("analyze-input").click();
 $("analyze-input").onchange = async (e) => {
-  const file = e.target.files[0];
+  const files = [...e.target.files];
   e.target.value = "";
-  if (!file) return;
+  if (!files.length) return;
   busy = true;
-  addMessage("user", `📊 直接声学分析：${file.name}`);
+  addMessage("user", `📊 直接声学分析：${files.map(f => f.name).join("、")}`);
   addTyping();
   try {
-    const fd = new FormData();
-    fd.append("file", file);
-    const r = await fetch("/api/analyze", { method: "POST", body: fd });
-    const d = await r.json();
+    const reports = [];
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch("/api/analyze", { method: "POST", body: fd });
+      const d = await r.json();
+      if (!r.ok) { addMessage("error", `${file.name}：${d.error || "分析失败"}`); continue; }
+      reports.push(d);
+    }
     removeTyping();
-    if (!r.ok) { addMessage("error", d.error || "分析失败"); return; }
-    addMessage("bot", formatReport(d));
+    if (reports.length === 1) {
+      addReportMessage(reports[0]);
+    } else if (reports.length > 1) {
+      addCompareMessage(reports);
+    }
   } catch (err) {
     removeTyping();
     addMessage("error", "分析失败：" + err);
   } finally { busy = false; }
 };
 
+// reference ranges used for the quality/normality flags
+const NORM = {
+  jitter: { warn: 1.0, bad: 2.0, lowerBetter: true },      // %
+  shimmer: { warn: 0.35, bad: 1.0, lowerBetter: true },    // dB
+  hnr: { warn: 20, bad: 10, lowerBetter: false },          // dB
+  snr: { warn: 20, bad: 10, lowerBetter: false },          // dB
+};
+function level(val, spec) {
+  if (val == null || isNaN(val)) return "na";
+  if (spec.lowerBetter) return val < spec.warn ? "ok" : val < spec.bad ? "warn" : "bad";
+  return val > spec.warn ? "ok" : val > spec.bad ? "warn" : "bad";
+}
+function qualityFlags(r) {
+  const p = r.pitch || {}, v = r.voice_quality || {}, q = r.recording_quality || {};
+  const flags = [];
+  const add = (lv, text) => flags.push({ lv, text });
+  if (p.n_voiced_frames) {
+    add(p.voiced_ratio > 0.5 ? "ok" : "warn", `浊音占比 ${(p.voiced_ratio * 100).toFixed(0)}%`);
+  } else add("warn", "未检测到浊音");
+  if (v.n_periods) {
+    add(level(v.jitter_local_percent, NORM.jitter), `jitter ${v.jitter_local_percent?.toFixed(2)}%（<1% 正常）`);
+    add(level(v.shimmer_local_db, NORM.shimmer), `shimmer ${v.shimmer_local_db?.toFixed(2)}dB（<0.35 正常）`);
+  }
+  add(level(r.hnr_db, NORM.hnr), `HNR ${r.hnr_db}dB（>20 稳定）`);
+  add(level(q.snr_db, NORM.snr), `信噪比 ${q.snr_db}dB（>20 良好）`);
+  (q.issues || []).forEach(i => add("bad", i));
+  return flags;
+}
+
+function addReportMessage(r) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = mdToHtml(formatReport(r));
+  bubble.appendChild(flagsEl(qualityFlags(r)));
+  if (r.pitch_contour) bubble.appendChild(contourEl(r.pitch_contour, r.file));
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  scrollBottom();
+}
+
+function flagsEl(flags) {
+  const box = document.createElement("div");
+  box.className = "flags";
+  for (const f of flags) {
+    const el = document.createElement("span");
+    el.className = `flag ${f.lv}`;
+    el.textContent = `${f.lv === "ok" ? "✓" : f.lv === "bad" ? "✗" : f.lv === "warn" ? "△" : "·"} ${f.text}`;
+    box.appendChild(el);
+  }
+  return box;
+}
+
+function addCompareMessage(reports) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = `<p><strong>📊 ${reports.length} 个录音对比</strong>（绿色为该指标最优）</p>`;
+
+  const rows = [
+    ["F0 中位数 (Hz)", r => r.pitch?.f0_median_hz, v => v?.toFixed(1), null],
+    ["F0 标准差 (Hz)", r => r.pitch?.f0_std_hz, v => v?.toFixed(1), "min"],
+    ["浊音占比 (%)", r => (r.pitch?.voiced_ratio ?? 0) * 100, v => v?.toFixed(0), "max"],
+    ["Jitter (%)", r => r.voice_quality?.jitter_local_percent, v => v?.toFixed(2), "min"],
+    ["Shimmer (dB)", r => r.voice_quality?.shimmer_local_db, v => v?.toFixed(2), "min"],
+    ["HNR (dB)", r => r.hnr_db, v => v?.toFixed(1), "max"],
+    ["信噪比 (dB)", r => r.recording_quality?.snr_db, v => v?.toFixed(1), "max"],
+    ["F1/F2/F3 (Hz)", r => r.formants ? [r.formants.F1_hz, r.formants.F2_hz, r.formants.F3_hz] : null,
+      v => v ? v.map(x => x.toFixed(0)).join("/") : "—", null],
+  ];
+  let html = '<div class="cmp-wrap"><table><thead><tr><th>指标</th>' +
+    reports.map(r => `<th>${escapeHtml(r.file)}</th>`).join("") + "</tr></thead><tbody>";
+  for (const [label, get, fmt, best] of rows) {
+    const vals = reports.map(get);
+    const nums = vals.filter(v => v != null && !isNaN(v) && typeof v === "number");
+    const bestVal = best === "min" ? Math.min(...nums) : best === "max" ? Math.max(...nums) : null;
+    html += `<tr><td>${label}</td>` + vals.map(v => {
+      const isBest = bestVal != null && v === bestVal && nums.length > 1;
+      return `<td class="${isBest ? "best" : ""}">${v == null || isNaN(v) ? "—" : fmt(v)}</td>`;
+    }).join("") + "</tr>";
+  }
+  html += "</tbody></table></div>";
+  bubble.innerHTML += html;
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+
+  // one contour chart per file below the table
+  for (const r of reports) {
+    if (r.pitch_contour) {
+      const w2 = document.createElement("div");
+      w2.className = "msg bot";
+      w2.innerHTML = `<div class="avatar">🎙️</div>`;
+      const b2 = document.createElement("div");
+      b2.className = "bubble";
+      b2.appendChild(contourEl(r.pitch_contour, r.file));
+      w2.appendChild(b2);
+      $("messages").appendChild(w2);
+    }
+  }
+  scrollBottom();
+}
+
+function contourEl(contour, name) {
+  const box = document.createElement("div");
+  box.className = "contour-box";
+  const title = document.createElement("div");
+  title.className = "contour-title";
+  title.textContent = `基频曲线 — ${name}`;
+  box.appendChild(title);
+
+  const W = 640, H = 180, padL = 44, padB = 22, padT = 10, padR = 8;
+  const t = contour.times_s, f = contour.f0_hz;
+  const pts = t.map((x, i) => [x, f[i]]).filter(p => p[1] != null);
+  if (!pts.length) { title.textContent += "（无浊音帧）"; return box; }
+  const tMax = Math.max(...t, 0.001);
+  const fVals = pts.map(p => p[1]);
+  let fMin = Math.min(...fVals), fMax = Math.max(...fVals);
+  if (fMax - fMin < 20) { const c = (fMax + fMin) / 2; fMin = c - 10; fMax = c + 10; }
+  const X = (x) => padL + (x / tMax) * (W - padL - padR);
+  const Y = (y) => padT + (1 - (y - fMin) / (fMax - fMin)) * (H - padT - padB);
+
+  // split into continuous voiced runs
+  let paths = "", run = [];
+  const flush = () => {
+    if (run.length > 1) {
+      paths += `<polyline fill="none" stroke="var(--accent)" stroke-width="1.8" points="` +
+        run.map(p => `${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ") + `"/>`;
+    }
+    run = [];
+  };
+  t.forEach((x, i) => { if (f[i] != null) run.push([x, f[i]]); else flush(); });
+  flush();
+
+  const gridY = [fMin, (fMin + fMax) / 2, fMax].map(v =>
+    `<line x1="${padL}" x2="${W - padR}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--border)" stroke-width="1"/>
+     <text x="${padL - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${v.toFixed(0)}</text>`).join("");
+  const gridX = [0, tMax / 2, tMax].map(v =>
+    `<text x="${X(v)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="var(--muted)">${v.toFixed(1)}s</text>`).join("");
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = gridY + gridX + paths;
+  box.appendChild(svg);
+  return box;
+}
+
 function formatReport(r) {
-  const p = r.pitch || {}, v = r.voice_quality || {};
+  const p = r.pitch || {}, v = r.voice_quality || {}, q = r.recording_quality || {};
   let out = `📊 ${r.file} 声学分析报告\n`;
   out += `时长：${r.duration_s} s @ ${r.sample_rate_hz} Hz\n\n`;
   if (p.n_voiced_frames) {
@@ -587,6 +763,9 @@ function formatReport(r) {
   out += `\n【HNR】${r.hnr_db} dB\n`;
   if (r.formants) {
     out += `\n【共振峰】F1 ${r.formants.F1_hz?.toFixed(0)} Hz，F2 ${r.formants.F2_hz?.toFixed(0)} Hz，F3 ${r.formants.F3_hz?.toFixed(0)} Hz\n`;
+  }
+  if (r.voiced_segments?.length) {
+    out += `\n【浊音段】` + r.voiced_segments.map(s => `${s.start_s}–${s.end_s}s`).join("，") + "\n";
   }
   out += "\n💡 想让我解读这些数据的含义？把文件用 📎 附上并提问即可。";
   return out;
