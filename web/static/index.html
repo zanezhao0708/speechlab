@@ -75,11 +75,37 @@
   .bubble {
     padding: 12px 16px; border-radius: 12px;
     line-height: 1.65; font-size: 14px;
-    white-space: pre-wrap; word-break: break-word;
+    word-break: break-word;
     max-width: 78%;
   }
-  .msg.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; white-space: pre-wrap; }
   .msg.bot .bubble { background: var(--bot-bubble); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+
+  /* markdown rendering inside bot bubbles */
+  .bubble p { margin: 0 0 8px; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 {
+    margin: 12px 0 6px; font-size: 15px; line-height: 1.4;
+  }
+  .bubble h1 { font-size: 17px; } .bubble h2 { font-size: 16px; }
+  .bubble ul, .bubble ol { margin: 4px 0 8px; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble code {
+    background: #2b3145; border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
+    color: #9ecbff;
+  }
+  .bubble pre {
+    background: #12141c; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+  }
+  .bubble pre code { background: none; padding: 0; color: var(--text); }
+  .bubble a { color: var(--accent); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  .bubble table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  .bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 10px; }
+  .bubble th { background: #262b3d; }
   .msg.error .bubble { border-color: var(--danger); color: var(--danger); }
 
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -295,6 +321,68 @@ $("settings-modal").onclick = (e) => {
   if (e.target === $("settings-modal")) $("settings-modal").classList.remove("open");
 };
 
+// ---------- markdown rendering ----------
+function mdToHtml(src) {
+  const codes = [];
+  src = src.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, code) => {
+    codes.push('<pre><code>' + escapeHtml(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\x00' + (codes.length - 1) + '\x00';
+  });
+  src = escapeHtml(src);
+  src = src.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  src = src.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  src = src.replace(/(^|[\s(（])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  src = src.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0, para = [], list = null;
+
+  const flushPara = () => { if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
+  const flushList = () => { if (list) { out.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; } };
+
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+
+    const cb = trimmed.match(/^\x00(\d+)\x00$/);
+    if (cb) { flushPara(); flushList(); out.push(codes[+cb[1]]); i++; continue; }
+    if (!trimmed) { flushPara(); flushList(); i++; continue; }
+
+    const h = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushPara(); flushList(); const n = h[1].length; out.push(`<h${n}>${h[2]}</h${n}>`); i++; continue; }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { flushPara(); flushList(); out.push('<hr>'); i++; continue; }
+
+    const ul = trimmed.match(/^[-*]\s+(.*)$/);
+    if (ul) { flushPara(); if (list !== 'ul') { flushList(); out.push('<ul>'); list = 'ul'; }
+      out.push('<li>' + ul[1] + '</li>'); i++; continue; }
+    const ol = trimmed.match(/^\d+[.)]\s+(.*)$/);
+    if (ol) { flushPara(); if (list !== 'ol') { flushList(); out.push('<ol>'); list = 'ol'; }
+      out.push('<li>' + ol[1] + '</li>'); i++; continue; }
+
+    if (trimmed.includes('|') && i + 1 < lines.length &&
+        /^\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1].trim()) && lines[i + 1].includes('-')) {
+      flushPara(); flushList();
+      const parseRow = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+      const head = parseRow(trimmed);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().includes('|')) { rows.push(parseRow(lines[i])); i++; }
+      out.push('<table><thead><tr>' + head.map(c => `<th>${c}</th>`).join('') +
+        '</tr></thead><tbody>' +
+        rows.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('') +
+        '</tbody></table>');
+      continue;
+    }
+
+    para.push(trimmed);
+    i++;
+  }
+  flushPara(); flushList();
+  return out.join('');
+}
+
 // ---------- chat rendering ----------
 function addMessage(role, text, files) {
   $("welcome")?.remove();
@@ -305,7 +393,8 @@ function addMessage(role, text, files) {
   avatar.textContent = role === "user" ? "🧑" : "🎙️";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  if (role === "bot") bubble.innerHTML = mdToHtml(text);
+  else bubble.textContent = text;
   if (files && files.length) {
     const chips = document.createElement("div");
     chips.className = "chips";
