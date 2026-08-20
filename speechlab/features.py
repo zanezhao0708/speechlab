@@ -101,9 +101,9 @@ def _batch_autocorr(fx: np.ndarray, lags: np.ndarray | None = None,
     cols = np.arange(n) if lags is None else np.asarray(lags, dtype=np.intp)
     out = np.empty((m, len(cols)), dtype=np.float64)
     for s in range(0, m, chunk):
-        F = rfft(fx[s : s + chunk], n=nfft, axis=1)
+        F = rfft(fx[s : s + chunk], n=nfft, axis=1, workers=-1)
         power = F.real ** 2 + F.imag ** 2
-        out[s : s + chunk] = irfft(power, n=nfft, axis=1)[:, cols]
+        out[s : s + chunk] = irfft(power, n=nfft, axis=1, workers=-1)[:, cols]
     return out
 
 
@@ -340,13 +340,24 @@ def _batch_formants(frames: np.ndarray, sr: int, order: int | None = None,
                 a[:, : k - 1] -= rc[:, None] * a[:, k - 2 :: -1]
             E = E * (1.0 - rc * rc)
 
+    # roots of 1 + a_1 z^-1 + ... via eigenvalues of the companion matrices,
+    # all frames in one batched LAPACK call (np.roots per frame spends most
+    # of its time in Python/overhead).  np.roots would strip trailing zero
+    # coefficients; the extra companion eigenvalues those introduce are
+    # real (at the origin) and filtered out below all the same.
+    m2 = len(idx)
+    comp = np.zeros((m2, order, order))
+    comp[:, 0, :] = -a
+    sub = np.arange(1, order)
+    comp[:, sub, sub - 1] = 1.0
+    roots = np.linalg.eigvals(comp)
+
     nyq_edge = sr / 2.0 - 50.0
+    freqs = np.angle(roots) * sr / (2.0 * np.pi)
+    band = ((np.abs(roots.imag) > 1e-10)
+            & (freqs > 90.0) & (freqs < nyq_edge))  # skip DC/Nyquist roots
     for row, i in enumerate(idx):
-        roots = np.roots(np.concatenate(([1.0], a[row])))
-        freqs = np.angle(roots) * sr / (2.0 * np.pi)
-        band = ((np.abs(roots.imag) > 1e-10)
-                & (freqs > 90.0) & (freqs < nyq_edge))  # skip DC/Nyquist roots
-        sel = np.sort(freqs[band])
+        sel = np.sort(freqs[row, band[row]])
         out[i] = [float(f) for f in sel[:max_formants]]
     return out
 
@@ -515,8 +526,13 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
     if not np.any(ok):
         return float("nan")
     fx, lag = fx[ok], lag[ok]
-    num = _batch_autocorr(fx)
-    num = num[np.arange(len(fx)), lag]
+    # only one lag is needed per frame, so a direct product grouped by lag
+    # (O(N) per frame) beats a full FFT autocorrelation over every lag;
+    # F0 varies slowly, so the number of distinct lags is tiny
+    num = np.empty(len(fx))
+    for L in np.unique(lag):
+        msk = lag == L
+        num[msk] = np.einsum("ij,ij->i", fx[msk, :-L], fx[msk, L:])
     # NCCF-style normalisation over the overlapping segments
     e1 = cum[ok, frame_length - lag]
     e2 = cum[ok, frame_length] - cum[ok, lag]
@@ -578,9 +594,13 @@ def cpps(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
     # return a longer array than `active`; clamp it for short recordings
     smoothing_frames = min(smoothing_frames, len(frames))
 
-    # real cepstrum: IFFT of the log magnitude spectrum (in dB)
-    spec = np.abs(rfft(frames, axis=1))
-    cep = irfft(20.0 * np.log10(np.maximum(spec, 1e-10)), n=frame_length, axis=1)
+    # real cepstrum: IFFT of the log magnitude spectrum (in dB); the log is
+    # done in place on the magnitude array to avoid large temporaries
+    spec = np.abs(rfft(frames, axis=1, workers=-1))
+    np.maximum(spec, 1e-10, out=spec)
+    np.log10(spec, out=spec)
+    spec *= 20.0
+    cep = irfft(spec, n=frame_length, axis=1, workers=-1)
 
     # per-frame linear trend over quefrency 0..q_max
     q = np.arange(q_max + 1, dtype=np.float64)
@@ -631,7 +651,7 @@ def spectral_stats(samples: np.ndarray, sr: int,
     if not np.any(active):
         return {}
 
-    spec = np.abs(rfft(frames[active], axis=1))
+    spec = np.abs(rfft(frames[active], axis=1, workers=-1))
     power = spec.mean(axis=0) ** 2
     freqs = rfftfreq(frame_length, 1.0 / sr)
 
