@@ -1,5 +1,7 @@
 # SpeechLab Agent
 
+[![CI](https://github.com/zanezhao0708/speechlab/actions/workflows/ci.yml/badge.svg)](https://github.com/zanezhao0708/speechlab/actions/workflows/ci.yml)
+
 An LLM research agent for speech science.
 
 SpeechLab Agent talks to any OpenAI-compatible chat API and grounds its
@@ -183,9 +185,37 @@ distinguish established results from hypotheses.
   Compact and offline — expect ~80–90 % frame accuracy on clean
   two-speaker audio, not production-grade diarization.
 
-These are classical, lightweight implementations intended for research
-triage; for publication-grade clinical numbers, cross-check against Praat
-or VoiceSauce.
+## Accuracy benchmark (SpeechLab vs Praat)
+
+The unit tests only prove the implementation is self-consistent on clean
+synthetic signals. For evidence against a reference implementation there is
+a benchmark harness in `benchmarks/praat_benchmark.py` that runs
+SpeechLab's shipped `analyze()` pipeline and Praat (via the official
+`praat-parselmouth` binding) on the same files and reports:
+
+- **F0** — frame-wise MAE (Hz and cents) on shared voiced frames, plus
+  per-file median-F0 Pearson r and Bland-Altman agreement;
+- **Formants** — MAE and Pearson r for F1/F2/F3;
+- **Jitter / shimmer / HNR** — Pearson r, bias and Bland-Altman limits of
+  agreement across files.
+
+```bash
+pip install -e ".[bench]"                     # parselmouth + matplotlib
+# self-check of the harness itself (no real data needed):
+python benchmarks/praat_benchmark.py --synthetic 24 --out bench_results
+# real evaluation (recommended: CMU Arctic, Saarbrücken Voice Database):
+python benchmarks/praat_benchmark.py /path/to/wavs --out bench_results
+```
+
+Outputs: `results.csv` (per file), `summary.json` / `summary.md`
+(headline table), `scatter.png` and `bland_altman.png` when matplotlib is
+installed.
+
+> Status: the harness is validated on synthetic data; the real-speech
+> numbers (100+ files across clean/noisy/pathological conditions) are the
+> next step and will be reported here. Until then treat SpeechLab's
+> formant and perturbation values as screening-grade, and cross-check
+> publication-grade numbers against Praat / VoiceSauce.
 
 ## Example
 
