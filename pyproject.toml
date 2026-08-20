@@ -32,7 +32,8 @@ dev = ["pytest>=7", "ruff>=0.4"]
 speechlab = "speechlab.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/speechlab/speechlab"
+Homepage = "https://github.com/zanezhao0708/speechlab"
+Issues = "https://github.com/zanezhao0708/speechlab/issues"
 
 [tool.setuptools.packages.find]
 include = ["speechlab*"]
