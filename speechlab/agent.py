@@ -25,6 +25,7 @@ from typing import Any
 
 from .audio import load_audio
 from .features import analyze as _analyze_audio
+from .features import compare_reports as _compare_reports
 
 __all__ = ["RESEARCH_SYSTEM_PROMPT", "AgentConfig", "SpeechResearchAgent", "build_tool_specs"]
 
@@ -43,12 +44,15 @@ You are knowledgeable about:
 Ground rules:
 1. When the user mentions a local audio file, ALWAYS use the analyze_audio
    tool to obtain measurements before interpreting them.  Never invent numbers.
-2. Report units (Hz, dB, ms, %) alongside every measurement and note normal
+2. When the user asks to compare two recordings (e.g. pre/post therapy,
+   two speakers, two conditions), use the compare_audio tool, which returns
+   both analyses plus numeric deltas.
+3. Report units (Hz, dB, ms, %) alongside every measurement and note normal
    ranges when giving clinical interpretations, with the caveat that clinical
    decisions require a certified professional.
-3. Suggest concrete, feasible next steps: analyses to run, confounds to
+4. Suggest concrete, feasible next steps: analyses to run, confounds to
    control, or papers/methods to consider.
-4. Be honest about uncertainty; distinguish established results from
+5. Be honest about uncertainty; distinguish established results from
    hypotheses.
 """
 
@@ -83,7 +87,7 @@ class AgentConfig:
 
 
 def build_tool_specs() -> list[dict]:
-    """OpenAI function-calling schema for the local analysis tool."""
+    """OpenAI function-calling schemas for the local analysis tools."""
     return [
         {
             "type": "function",
@@ -91,7 +95,8 @@ def build_tool_specs() -> list[dict]:
                 "name": "analyze_audio",
                 "description": (
                     "Acoustic analysis of one audio file: duration, F0 statistics, "
-                    "jitter/shimmer, HNR and formant estimates."
+                    "jitter/shimmer, HNR, CPPS, spectral and pause structure, "
+                    "and formant estimates."
                 ),
                 "parameters": {
                     "type": "object",
@@ -99,6 +104,27 @@ def build_tool_specs() -> list[dict]:
                         "path": {"type": "string", "description": "path to the audio file"},
                     },
                     "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "compare_audio",
+                "description": (
+                    "Compare two audio files acoustically (e.g. pre/post therapy or "
+                    "two speakers): runs the full analysis on both and returns both "
+                    "reports plus deltas (B minus A) of the key measures."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path_a": {"type": "string",
+                                   "description": "path to the baseline (A) audio file"},
+                        "path_b": {"type": "string",
+                                   "description": "path to the comparison (B) audio file"},
+                    },
+                    "required": ["path_a", "path_b"],
                 },
             },
         },
@@ -140,7 +166,16 @@ class SpeechResearchAgent:
         def analyze_audio(args: dict) -> dict:
             return _analyze_audio(load_audio(args["path"]))
 
-        return {"analyze_audio": analyze_audio}
+        def compare_audio(args: dict) -> dict:
+            report_a = _analyze_audio(load_audio(args["path_a"]))
+            report_b = _analyze_audio(load_audio(args["path_b"]))
+            return {
+                "file_a": report_a,
+                "file_b": report_b,
+                "deltas": _compare_reports(report_a, report_b),
+            }
+
+        return {"analyze_audio": analyze_audio, "compare_audio": compare_audio}
 
     # ------------------------------------------------------------------
     # transport

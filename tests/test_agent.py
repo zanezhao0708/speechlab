@@ -38,7 +38,7 @@ class _FakeResponse:
 def test_tool_specs_valid():
     specs = build_tool_specs()
     names = {s["function"]["name"] for s in specs}
-    assert names == {"analyze_audio"}
+    assert names == {"analyze_audio", "compare_audio"}
     for s in specs:
         assert s["type"] == "function"
         json.dumps(s)  # serialisable
@@ -66,6 +66,19 @@ def test_local_tool_analyze_audio(tmp_path):
     result = agent.tools["analyze_audio"]({"path": str(path)})
     assert result["sample_rate_hz"] == 16000
     assert result["pitch"]["n_voiced_frames"] > 0
+
+
+def test_local_tool_compare_audio(tmp_path):
+    a = write_wav(str(tmp_path / "a.wav"), vowel_like(duration_s=0.5, f0_hz=120.0), 16000)
+    b = write_wav(str(tmp_path / "b.wav"), vowel_like(duration_s=0.5, f0_hz=180.0), 16000)
+    agent = SpeechResearchAgent(AgentConfig(api_key="sk-test", model="test"))
+    result = agent.tools["compare_audio"]({"path_a": a, "path_b": b})
+    f0_a = result["file_a"]["pitch"]["f0_median_hz"]
+    f0_b = result["file_b"]["pitch"]["f0_median_hz"]
+    assert f0_a < f0_b
+    assert result["deltas"]["pitch.f0_median_hz"] == pytest.approx(f0_b - f0_a, abs=1.0)
+    # the payload must stay JSON-serialisable for the tool-call round-trip
+    json.dumps(result)
 
 
 def test_tool_error_is_reported_not_raised(tmp_path):

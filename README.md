@@ -5,8 +5,9 @@ An LLM research agent for speech science.
 SpeechLab Agent talks to any OpenAI-compatible chat API and grounds its
 answers in **locally measured acoustics**: when you point it at an audio
 file, it calls its built-in `analyze_audio` tool (F0, formants,
-jitter/shimmer, HNR) through standard function calling and interprets the
-real numbers instead of guessing.
+jitter/shimmer, HNR, CPPS, spectral shape, speech/pause structure)
+through standard function calling, or `compare_audio` to contrast two
+recordings, and interprets the real numbers instead of guessing.
 
 ```
 $ speechlab agent "这例嗓音的 F0 和 jitter 数据说明什么?" --context patient.wav
@@ -27,13 +28,16 @@ You ─────────────────▶ LLM (OpenAI-compatibl
 
 - **Agent loop** — `SpeechResearchAgent.ask()` runs a standard
   tool-calling loop (up to 6 rounds): the model requests
-  `analyze_audio(path)`, the tool returns a JSON report, and the model
+  `analyze_audio(path)` (or `compare_audio(path_a, path_b)` for
+  pre/post comparisons), the tool returns a JSON report, and the model
   writes its grounded answer.
-- **Acoustic core** — the one tool the agent owns:
+- **Acoustic core** — the tools the agent owns:
   F0 tracking (NCCF autocorrelation with subharmonic suppression and
   parabolic interpolation), formants F1–F3 (LPC roots with
   sample-rate-aware pre-emphasis), jitter / shimmer (epoch-based
-  perturbation), HNR (autocorrelation estimate).
+  perturbation), HNR (autocorrelation estimate), CPPS (smoothed
+  cepstral peak prominence), LTAS spectral shape (centroid, tilt,
+  flatness), and energy-based voice activity / pause structure.
 - **Lean** — only `numpy`, `scipy` and `click`; `soundfile` optional for
   mp3/flac/ogg.
 
@@ -58,7 +62,9 @@ speechlab agent "Design a speaker-independent evaluation protocol"
 speechlab agent "Interpret these voice measures" --context patient.wav
 
 # the analysis the agent runs under the hood, standalone:
-speechlab analyze patient.wav
+speechlab analyze patient.wav          # one file
+speechlab analyze pre.wav post.wav     # several files
+speechlab compare pre.wav post.wav     # side-by-side deltas (B minus A)
 speechlab info patient.wav
 ```
 
@@ -112,6 +118,18 @@ distinguish established results from hypotheses.
   (quarter-period smoothing suppresses formant ripple), local
   period-to-period and amplitude perturbation.
 - **HNR**: autocorrelation-based, `10·log10(r/(1−r))` at the tracked F0 lag.
+- **CPPS**: 40 ms / 5 ms Hann frames, real cepstrum of the dB magnitude
+  spectrum, peak over the 60–500 Hz quefrency band measured against a
+  per-frame least-squares trend line, smoothed ~60 ms and averaged over
+  energetic frames.  Absolute values are implementation-specific —
+  interpret changes within this library (e.g. pre vs post therapy)
+  rather than against external thresholds.
+- **Spectral shape**: LTAS of energetic Hann frames — energy-weighted
+  centroid, dB/kHz tilt (least-squares slope), geometric/arithmetic
+  flatness.
+- **Voice activity**: RMS-energy VAD; inactive gaps under 60 ms are
+  bridged, segments under 20 ms dropped, yielding speech segments,
+  pause count/duration and speaking-time ratio.
 
 These are classical, lightweight implementations intended for research
 triage; for publication-grade clinical numbers, cross-check against Praat

@@ -1,15 +1,24 @@
 """Tests for the acoustic analysis core used by the agent."""
 
+import json
+
 import numpy as np
 import pytest
 
-from speechlab.audio import load_audio
+from speechlab.audio import frame_signal, load_audio
 from speechlab.features import (
+    activity_summary,
     analyze,
+    compare_reports,
+    cpps,
+    default_frame_lengths,
     f0_track,
     formants,
     hnr,
     jitter_shimmer,
+    report_field,
+    spectral_stats,
+    vad_segments,
 )
 
 from .helpers import noise, tone, vowel_like, write_wav
@@ -137,3 +146,149 @@ def test_hnr_accepts_precomputed_track():
     x = tone(200.0, 1.0, sr=sr, amp=0.5)
     track = f0_track(x, sr)
     assert hnr(x, sr, track=track) == pytest.approx(hnr(x, sr))
+
+
+# ---------------------------------------------------------------------- CPPS
+def test_cpps_discriminates_breathiness():
+    """Harmonic-rich > breathy > noise: CPPS falls as noise mixes in."""
+    sr = 16000
+    clean = vowel_like(f0_hz=150.0, duration_s=1.0, sr=sr)
+    breathy = clean + 0.6 * noise(1.0, sr=sr, amp=0.25, seed=5)
+    noisy = noise(1.0, sr=sr, amp=0.25, seed=5)
+    assert cpps(clean, sr) > cpps(breathy, sr) > cpps(noisy, sr)
+
+
+def test_cpps_silence_is_nan():
+    assert np.isnan(cpps(np.zeros(16000), 16000))
+
+
+# ------------------------------------------------------------------ spectral
+def test_spectral_stats_vowel_vs_noise():
+    sr = 16000
+    v = spectral_stats(vowel_like(f0_hz=140.0, duration_s=1.0, sr=sr), sr)
+    n = spectral_stats(noise(1.0, sr=sr, amp=0.3, seed=3), sr)
+    assert 0 < v["spectral_centroid_hz"] < sr / 2
+    # vowel energy is low-frequency, noise is spread to Nyquist
+    assert v["spectral_centroid_hz"] < n["spectral_centroid_hz"]
+    # vowel LTAS slopes down, white noise is flat
+    assert v["spectral_tilt_db_per_khz"] < -3.0
+    assert abs(n["spectral_tilt_db_per_khz"]) < 3.0
+    # harmonic signal is far from flat, noise is nearly flat
+    assert v["spectral_flatness"] < 0.1 < n["spectral_flatness"]
+
+
+def test_spectral_stats_silence_is_empty():
+    assert spectral_stats(np.zeros(16000), 16000) == {}
+
+
+# ----------------------------------------------------------------------- VAD
+def _speech_pause_speech(sr=16000):
+    """1 s vowel, 0.5 s silence, 1 s vowel."""
+    return np.concatenate([
+        vowel_like(f0_hz=140.0, duration_s=1.0, sr=sr),
+        np.zeros(round(0.5 * sr)),
+        vowel_like(f0_hz=180.0, duration_s=1.0, sr=sr),
+    ])
+
+
+def test_vad_segments_split_by_silence():
+    sr = 16000
+    segs = vad_segments(_speech_pause_speech(sr), sr)
+    assert len(segs) == 2
+    (s0, e0), (s1, e1) = segs
+    assert s0 == pytest.approx(0.0, abs=0.05)
+    assert e0 == pytest.approx(1.0, abs=0.1)
+    assert s1 == pytest.approx(1.5, abs=0.1)
+    assert e1 == pytest.approx(2.5, abs=0.05)
+
+
+def test_vad_bridges_short_pauses():
+    """A 30 ms dip is shorter than min_pause_s (60 ms) and is bridged."""
+    sr = 16000
+    x = vowel_like(f0_hz=140.0, duration_s=0.6, sr=sr)
+    i = round(0.3 * sr)
+    x[i : i + round(0.03 * sr)] = 0.0
+    assert len(vad_segments(x, sr)) == 1
+
+
+def test_vad_drops_short_blips():
+    """A 10 ms burst is not a speech segment (min_speech_s=50 ms here)."""
+    sr = 16000
+    x = np.zeros(round(1.0 * sr))
+    i = round(0.5 * sr)
+    x[i : i + round(0.01 * sr)] = 0.5
+    assert vad_segments(x, sr, min_speech_s=0.05) == []
+
+
+def test_vad_accepts_precomputed_frames():
+    sr = 16000
+    x = _speech_pause_speech(sr)
+    fl, hl = default_frame_lengths(sr)
+    frames = frame_signal(x, fl, hl, window="rect", center=True)
+    assert vad_segments(x, sr, frames=frames) == vad_segments(x, sr)
+
+
+def test_vad_all_silence():
+    assert vad_segments(np.zeros(16000), 16000) == []
+
+
+def test_activity_summary_structure():
+    sr = 16000
+    a = activity_summary(_speech_pause_speech(sr), sr)
+    assert a["n_speech_segments"] == 2
+    assert a["n_pauses"] == 1
+    assert a["mean_pause_s"] == pytest.approx(0.5, abs=0.1)
+    assert a["max_pause_s"] == pytest.approx(0.5, abs=0.1)
+    assert a["speech_ratio"] == pytest.approx(0.8, abs=0.1)
+    assert a["pause_time_s"] == pytest.approx(0.5, abs=0.15)
+
+
+def test_activity_summary_all_silence():
+    a = activity_summary(np.zeros(16000), 16000)
+    assert a["n_speech_segments"] == 0
+    assert a["n_pauses"] == 0
+    assert a["speech_ratio"] == 0.0
+
+
+# ---------------------------------------------------------------- comparison
+def test_compare_reports_deltas():
+    a = {
+        "duration_s": 1.0,
+        "pitch": {"f0_median_hz": 100.0},
+        "voice_quality": {"jitter_local_percent": float("nan")},
+        "hnr_db": 10.0,
+    }
+    b = {
+        "duration_s": 2.0,
+        "pitch": {"f0_median_hz": 110.0},
+        "voice_quality": {"jitter_local_percent": 1.0},
+        "hnr_db": 12.5,
+    }
+    d = compare_reports(a, b)
+    assert d["duration_s"] == pytest.approx(1.0)
+    assert d["pitch.f0_median_hz"] == pytest.approx(10.0)
+    assert d["hnr_db"] == pytest.approx(2.5)
+    # NaN jitter in A cannot be compared — skipped, not crashed
+    assert "voice_quality.jitter_local_percent" not in d
+
+
+def test_report_field_paths():
+    r = {"pitch": {"f0_median_hz": 100.0, "note": "x"}, "file": "a.wav"}
+    assert report_field(r, "pitch.f0_median_hz") == 100.0
+    assert report_field(r, "pitch.f0_mean_hz") is None       # missing key
+    assert report_field(r, "file") is None                   # non-numeric
+    assert report_field(r, "missing.deeper.path") is None    # missing branch
+
+
+# ---------------------------------------------------------------- full report
+def test_analyze_includes_new_measures(tmp_path):
+    sr = 16000
+    x = _speech_pause_speech(sr)
+    path = write_wav(str(tmp_path / "utt.wav"), x, sr)
+    report = analyze(load_audio(path))
+    assert np.isfinite(report["cpps_db"])
+    assert 0 < report["spectral"]["spectral_centroid_hz"] < sr / 2
+    assert report["activity"]["n_speech_segments"] == 2
+    assert report["activity"]["n_pauses"] == 1
+    # everything must survive a JSON round-trip (LLM tool payload)
+    json.dumps(report)

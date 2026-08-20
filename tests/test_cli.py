@@ -47,6 +47,44 @@ def test_cli_analyze_json(sample_wav):
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["pitch"]["f0_median_hz"] == pytest.approx(130.0, rel=0.05)
+    # new measures are part of every report
+    assert "cpps_db" in data
+    assert "spectral" in data and "activity" in data
+
+
+def test_cli_analyze_multiple_files(sample_wav, tmp_path):
+    other = write_wav(str(tmp_path / "utt2.wav"),
+                      vowel_like(duration_s=1.0, f0_hz=160.0), 16000)
+    runner = CliRunner()
+    result = runner.invoke(main, ["analyze", sample_wav, other, "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert isinstance(data, list) and len(data) == 2
+    assert data[0]["pitch"]["f0_median_hz"] == pytest.approx(130.0, rel=0.05)
+    assert data[1]["pitch"]["f0_median_hz"] == pytest.approx(160.0, rel=0.05)
+
+
+def test_cli_compare_table(sample_wav, tmp_path):
+    other = write_wav(str(tmp_path / "utt2.wav"),
+                      vowel_like(duration_s=1.0, f0_hz=160.0), 16000)
+    runner = CliRunner()
+    result = runner.invoke(main, ["compare", sample_wav, other])
+    assert result.exit_code == 0
+    assert "File A" in result.output and "File B" in result.output
+    assert "F0 median (Hz)" in result.output
+    assert "CPPS (dB)" in result.output
+
+
+def test_cli_compare_json(sample_wav, tmp_path):
+    other = write_wav(str(tmp_path / "utt2.wav"),
+                      vowel_like(duration_s=1.0, f0_hz=160.0), 16000)
+    runner = CliRunner()
+    result = runner.invoke(main, ["compare", sample_wav, other, "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert set(data) == {"file_a", "file_b", "deltas"}
+    assert data["file_a"]["file"] == sample_wav
+    assert data["deltas"]["pitch.f0_median_hz"] == pytest.approx(30.0, abs=10.0)
 
 
 def test_cli_agent_without_key(sample_wav, monkeypatch):
