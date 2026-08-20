@@ -165,10 +165,15 @@ distinguish established results from hypotheses.
 - **F0**: 25 ms / 10 ms frames, normalised cross-correlation over 60–500 Hz,
   shortest-lag-within-tolerance peak picking (anti-subharmonic), parabolic
   refinement, 3-frame median smoothing.
-- **Formants**: LPC (Levinson–Durbin) on 25 ms frames, pre-emphasis
-  coefficient derived from the sample rate (50 Hz corner, Praat-style —
-  a fixed 0.97 crushes the F1 region at 16 kHz), root finding with DC and
-  Nyquist roots discarded.
+- **Formants**: LPC (Levinson–Durbin) on 25 ms frames following Praat's
+  Formant(Burg) conventions — the signal is first resampled to twice the
+  formant ceiling (5.5 kHz by default), pre-emphasis uses Praat's exact
+  `α = exp(−2π·f·Δt)` (50 Hz corner), the analysis order is 2 poles per
+  formant (5 formants / 10 poles), and only **voiced** frames (energetic
+  half) enter the median, so plosive bursts and fricatives cannot pose as
+  formants. DC and Nyquist-adjacent roots are discarded.
+  Validated against known-pole synthetic signals in
+  `tests/test_formant_golden.py`.
 - **Jitter/shimmer**: epoch picking on a low-pass smoothed waveform
   (quarter-period smoothing suppresses formant ripple), local
   period-to-period and amplitude perturbation. Computed on the longest
@@ -216,6 +221,13 @@ installed.
 > next step and will be reported here. Until then treat SpeechLab's
 > formant and perturbation values as screening-grade, and cross-check
 > publication-grade numbers against Praat / VoiceSauce.
+>
+> Current synthetic-set agreement (20 source-filter vowels, clean/noisy/
+> 8 kHz conditions): F1 MAE 23 Hz (r = 0.91), F2 103 Hz (r = 0.91),
+> F3 67 Hz (r = 0.99), HNR r = 0.97. Jitter/shimmer correlate weakly with
+> Praat (r ≈ 0.15–0.32) — the epoch-based lightweight estimators differ
+> from Praat's point-process definitions, so use them for triage, not
+> publication numbers.
 
 ## Example
 

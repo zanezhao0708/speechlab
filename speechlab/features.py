@@ -194,9 +194,12 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
 # --------------------------------------------------------------------------
 
 def lpc(samples: np.ndarray, order: int) -> np.ndarray:
-    """Linear prediction coefficients (a_1..a_order) via Levinson-Durbin.
+    """Linear prediction denominator coefficients (a_1..a_order).
 
-    Returns the denominator polynomial without the leading 1.
+    Solves the Yule-Walker (Toeplitz) equations and returns the NEGATED
+    predictor coefficients, so that the all-pole filter denominator is
+    ``1 + a_1·z⁻¹ + … + a_order·z⁻ᵒʳᵈᵉʳ`` (leading 1 omitted) and the
+    resonance frequencies are simply the roots of ``[1, *a]``.
     """
     from scipy.linalg import solve_toeplitz
 
@@ -208,36 +211,42 @@ def lpc(samples: np.ndarray, order: int) -> np.ndarray:
     if np.allclose(r[0], 0.0):
         return np.zeros(order)
     a = solve_toeplitz(r[:order], r[1 : order + 1])
-    return np.asarray(a, dtype=np.float64)
+    return -np.asarray(a, dtype=np.float64)
 
 
 def _auto_pre_emphasis(sr: int) -> float:
-    """Pre-emphasis coefficient giving a -3 dB corner at 50 Hz (Praat-style).
+    """Pre-emphasis coefficient for a 50 Hz corner, exactly as Praat does it.
 
-    A fixed 0.97 coefficient is far too aggressive at 16 kHz — it flattens
-    the whole F1 region — so the coefficient is derived from the sample rate.
+    Praat's ``Pre-emphasize (from frequency f)`` uses ``α = exp(−2π·f·Δt)``
+    with ``Δt = 1/sr`` (Praat manual: at 10 kHz, a corner of 48.47 Hz
+    corresponds to the classic α = 0.97).  Applied as ``x[n] − α·x[n−1]``.
     """
-    w = 2.0 * np.pi * 50.0 / sr
-    c = float(np.cos(w))
-    disc = c * c - 0.5
-    if disc <= 0:  # only for absurdly low sample rates
-        return 0.0
-    return c - np.sqrt(disc)
+    return float(np.exp(-2.0 * np.pi * 50.0 / sr))
 
 
 def formants(samples: np.ndarray, sr: int, order: int | None = None,
              pre_emphasis: float | None = None,
-             max_formants: int = 4) -> list[float]:
+             max_formants: int = 5) -> list[float]:
     """Estimate formant frequencies (Hz) for one analysis frame via LPC roots.
 
     Parameters
     ----------
-    order : LPC order; defaults to ``min(16, 2 + sr/1000)``.
-    pre_emphasis : coefficient; ``None`` derives one from the sample rate
-        (50 Hz corner).  Pass ``0.0`` to disable.
+    order : LPC order; defaults to ``2·max_formants`` (one complex pole
+        pair per formant — Praat's Formant(Burg) uses the same rule and
+        defaults to 5 formants / 10 poles).
+    pre_emphasis : coefficient; ``None`` derives the 50 Hz-corner
+        Praat coefficient from the sample rate.  Pass ``0.0`` to disable.
+
+    Note
+    ----
+    Praat resamples to twice the formant ceiling before LPC (without it,
+    formant estimates at high sample rates are markedly off — the LPC
+    poles get spent on harmonic structure above the formant region).
+    :func:`analyze` does this resampling; when calling ``formants`` on
+    full-rate frames yourself, prefer frames already at ≤ 2×ceiling rate.
     """
     if order is None:
-        order = min(16, int(2 + sr / 1000.0))
+        order = 2 * max_formants
     if pre_emphasis is None:
         pre_emphasis = _auto_pre_emphasis(sr)
     x = np.asarray(samples, dtype=np.float64)
@@ -867,11 +876,46 @@ def compare_reports(a: dict, b: dict) -> dict:
 # the agent's tool entry point
 # --------------------------------------------------------------------------
 
-def analyze(audio: AudioData, contour: bool = False) -> dict:
+FORMANT_CEILING_HZ = 5500.0
+"""Default formant ceiling (Hz).  Praat resamples to twice this rate before
+LPC so that the analysis bandwidth matches the range where formants live;
+we follow the same practice."""
+
+
+def _resample_for_formants(x: np.ndarray, sr: int,
+                           ceiling: float) -> tuple[np.ndarray, int]:
+    """Downsample to (at most) ``2·ceiling`` Hz for formant analysis.
+
+    Praat's Formant(Burg) does exactly this — without it, high sample rates
+    force very high LPC orders and the estimate degrades.  Uses an exact
+    rational factor when it is cheap, otherwise plain decimation.
+    """
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    target = 2.0 * ceiling
+    if sr <= target:
+        return x, sr
+    t_int = round(target)
+    g = gcd(int(sr), t_int)
+    up, down = t_int // g, sr // g
+    if up > 64:  # exact factor too costly — integer decimation instead
+        # closest divisor-ish rate, never exceeding the target by >2 %
+        up = 1
+        down = max(1, round(sr / target))
+        while sr / down > target * 1.02:
+            down += 1
+    return resample_poly(x, up, down), sr * up // down
+
+
+def analyze(audio: AudioData, contour: bool = False,
+            formant_ceiling: float = FORMANT_CEILING_HZ) -> dict:
     """Run a standard acoustic analysis and return a JSON-ready dict.
 
     With ``contour=True`` a downsampled F0 track (``pitch_contour``) is
-    included for plotting.
+    included for plotting.  ``formant_ceiling`` follows Praat's Formant(Burg)
+    convention: the signal is resampled to twice the ceiling before LPC.
     """
     sr, x = audio.sample_rate, audio.samples
     # pitch is the most expensive stage — compute once and share it with
@@ -892,22 +936,32 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
     else:
         js = jitter_shimmer(x, sr, track=track)
         js_segment = None
-    fl, hl = default_frame_lengths(sr)
-    # median formants over the most energetic voiced frames
-    frames = frame_signal(x, fl, hl, window="rect", center=True)
-    energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12) if len(frames) else np.empty(0)
-    top = np.argsort(energy)[-max(5, len(energy) // 10):] if len(energy) else []
-    formant_rows = [formants(frames[i], sr) for i in top]
-    formant_rows = [r for r in formant_rows if len(r) >= 3]
-    if formant_rows:
-        f_stack = np.vstack([r[:3] for r in formant_rows])
-        formant_summary = {
-            "F1_hz": float(np.median(f_stack[:, 0])),
-            "F2_hz": float(np.median(f_stack[:, 1])),
-            "F3_hz": float(np.median(f_stack[:, 2])),
-        }
-    else:
-        formant_summary = {}
+
+    # ---- formants: voiced frames only, analysed at 2× the ceiling rate.
+    # Voicing matters: the loudest frames of an utterance are often
+    # plosive bursts or fricatives, whose LPC roots are not formants.
+    formant_summary: dict = {}
+    x_f, sr_f = _resample_for_formants(x, sr, formant_ceiling)
+    fl_f, hl_f = default_frame_lengths(sr_f)
+    frames_f = frame_signal(x_f, fl_f, hl_f, window="rect", center=True)
+    if len(frames_f):
+        voiced_f = track.voiced[: len(frames_f)]
+        if np.any(voiced_f):
+            energy_f = np.sqrt(np.mean(frames_f ** 2, axis=1) + 1e-12)
+            cand = np.where(voiced_f)[0]
+            # most energetic half of the voiced frames (≥5 when available):
+            # keeps the vowel core, drops glide/nasal tails
+            cand = cand[np.argsort(energy_f[cand])]
+            cand = cand[-max(5, len(cand) // 2):] if len(cand) > 5 else cand
+            formant_rows = [formants(frames_f[i], sr_f) for i in cand]
+            formant_rows = [r for r in formant_rows if len(r) >= 3]
+            if formant_rows:
+                f_stack = np.vstack([r[:3] for r in formant_rows])
+                formant_summary = {
+                    "F1_hz": float(np.median(f_stack[:, 0])),
+                    "F2_hz": float(np.median(f_stack[:, 1])),
+                    "F3_hz": float(np.median(f_stack[:, 2])),
+                }
 
     report = {
         "file": audio.path,
@@ -921,7 +975,7 @@ def analyze(audio: AudioData, contour: bool = False) -> dict:
         "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
         "formants": formant_summary,
         "recording_quality": recording_quality(x, sr),
-        "voiced_segments": voiced_segments(track),
+        "voiced_segments": segs,
         "pause_stats": pause_stats(x, sr),
     }
     if contour:

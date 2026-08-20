@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from speechlab.audio import load_audio
+from speechlab.audio import AudioData, load_audio
 from speechlab.features import (
     analyze,
     f0_track,
@@ -41,16 +41,20 @@ def test_f0_summary_keys():
 
 # ------------------------------------------------------------------ formants
 def test_formants_of_synthetic_vowel():
+    """Full pipeline recovers designed formants of a source-filter vowel.
+
+    Tolerances match what Praat itself deviates on the same synthetic
+    signals (measured during development; see test_formant_golden.py for
+    the tight, ground-truth-level validation).
+    """
     sr = 16000
     x = vowel_like(f0_hz=120.0, duration_s=0.3, sr=sr,
-                   formants=((500.0, 1.0), (1500.0, 0.6)))
-    fl = int(0.025 * sr)
-    center = x[len(x) // 2 : len(x) // 2 + fl]
-    f = formants(center, sr)
-    assert len(f) >= 2
-    # F1 near 500 Hz, F2 near 1500 Hz (±20 %)
-    assert f[0] == pytest.approx(500.0, rel=0.2)
-    assert f[1] == pytest.approx(1500.0, rel=0.2)
+                   formants=((500.0, 1.0), (1500.0, 0.6), (2440.0, 0.3)))
+    report = analyze(AudioData(samples=x, sample_rate=sr, path=None))
+    fmt = report["formants"]
+    assert fmt["F1_hz"] == pytest.approx(500.0, rel=0.12)
+    assert fmt["F2_hz"] == pytest.approx(1500.0, rel=0.12)
+    assert fmt["F3_hz"] == pytest.approx(2440.0, rel=0.2)
 
 
 def test_formants_order():
