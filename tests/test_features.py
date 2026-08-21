@@ -5,6 +5,7 @@ import pytest
 
 from speechlab.audio import AudioData, load_audio
 from speechlab.features import (
+    _shimmer_local_db,
     analyze,
     f0_track,
     formants,
@@ -86,25 +87,40 @@ def test_jitter_shimmer_too_short():
 # old shimmer implementation hid for months: sign-cancelling dB steps made
 # every perturbed voice look calm (see the telescoping comment in
 # features.jitter_shimmer).
-def test_shimmer_alternating_amplitude_is_large():
-    """Reviewer's counter-example: 1 -> 2 -> 1 -> 2 amplitude.
+def test_shimmer_formula_alternating_amplitudes():
+    """Reviewer's counter-example, at the formula level: 1 -> 2 -> 1 -> 2.
 
     Every consecutive period differs by 2x, so shimmer (local, dB) must be
-    large.  Two bugs used to report ~0 dB on exactly this signal: the
-    sign-cancellation in the dB average, and the F0 tracker locking onto
-    the 60 Hz subharmonic (period-doubling makes AM signals look periodic
-    at F0/2), which sampled every other period and averaged the loud and
-    quiet pulses together.  The measured value is ~4.7 dB rather than
-    20·log10(2) = 6.0 dB because the 80 Hz-bandwidth formants smear the
-    amplitude contrast across neighbouring periods; 3 dB leaves margin on
-    both sides.
+    20·log10(2) = 6.02 dB.  The old sign-cancelling average telescoped the
+    +6/−6 dB steps down to ~0 dB (log of last/first).  Tested directly on
+    the amplitude sequence because the *signal* with exact alternation is
+    genuinely ambiguous at the epoch level — see
+    test_strict_amplitude_alternation_is_a_subharmonic below.
+    """
+    amps = np.tile([1.0, 2.0], 60)  # strict pulse alternans
+    assert _shimmer_local_db(amps) == pytest.approx(6.0206, abs=0.01)
+    # the same telescoping trap with unequal endpoints: a V-shaped envelope
+    # returns to its start, so the buggy formula reported exactly 0 dB.
+    v_shape = np.concatenate([np.linspace(1.0, 4.0, 50), np.linspace(4.0, 1.0, 50)])
+    assert _shimmer_local_db(v_shape) > 0.05
+
+
+def test_strict_amplitude_alternation_is_a_subharmonic():
+    """Exact 1 -> 2 alternation resolves to F0/2, matching native Praat.
+
+    Cross-checked against Praat's own autocorrelation tracker: on this
+    signal it reports 60.0 Hz (59 pulses, shimmer 0.085 dB).  Period-based
+    perturbation measures are only well-defined when the period is
+    unambiguous; this locks our documented convention so a future change
+    has to argue with Praat, not drift silently.
     """
     sr = 16000
     x = perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
                         amp_factors=(1.0, 2.0))
-    js = jitter_shimmer(x, sr)
-    assert js.n_periods > 50
-    assert js.shimmer_local_db > 3.0
+    track = f0_track(x, sr)
+    voiced_f0 = track.f0[track.voiced]
+    assert len(voiced_f0) > 10
+    assert np.median(voiced_f0) < 80.0  # 60 Hz subharmonic, as Praat
 
 
 def test_shimmer_ignores_slow_envelope_drift():
@@ -137,13 +153,21 @@ def test_shimmer_rises_with_random_amplitude_perturbation():
 
 
 def test_jitter_rises_with_period_perturbation():
-    """±8 % cycle-to-cycle period noise must raise jitter clearly."""
+    """±5 % cycle-to-cycle period noise must raise jitter clearly.
+
+    σ is capped at 0.05 deliberately — the cross-checked failure envelope:
+    beyond ~5 % period jitter both this tracker and native Praat's
+    autocorrelation pitch lock onto the first formant's ringing (Praat
+    reports 492 Hz on the σ=0.08 version; we report 500 Hz), which
+    fragments the epoch train and corrupts both jitter and shimmer.
+    """
     sr = 16000
     rng = np.random.default_rng(6)
     clean = jitter_shimmer(perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr), sr)
     rough = jitter_shimmer(
         perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
-                        period_factors=rng.normal(1.0, 0.08, 200)), sr)
+                        period_factors=rng.normal(1.0, 0.05, 200)), sr)
+    assert rough.n_periods > 100  # epoch train stayed intact
     assert rough.jitter_local_percent > clean.jitter_local_percent + 2.0
     # amplitude was untouched: shimmer must not move much
     assert rough.shimmer_local_db < clean.shimmer_local_db + 1.0

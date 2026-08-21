@@ -101,23 +101,98 @@ class F0Track:
         }
 
 
+# Peak-selection constants for the pitch tracker (see _select_period).
+_TOL_PEAK = 0.05    # candidate peaks must sit within this of the maximum
+_DELTA_OCT = 0.008  # half-period rejection margin (see _select_period)
+_TOL_MULT = 0.12    # multiple-chain validation floor, relative to maximum
+
+
+def _select_period(a: np.ndarray, lags: np.ndarray) -> int | None:
+    """Pick the fundamental-period lag index from one frame's NCCF ``a``.
+
+    For a nearly periodic frame the NCCF peaks at T, 2T, 3T… are almost
+    equally high — their differences are of the same order as per-frame
+    jitter/noise (~0.01) — so "the global maximum" is a coin flip between
+    subharmonics, and "first lag above 85 % of max" grabs peak *slopes*.
+    Instead:
+
+    1. candidates = local maxima within ``_TOL_PEAK`` of the maximum;
+    2. walk from the shortest lag and *reject* a candidate P when the
+       peak at 2P is clearly stronger (``_DELTA_OCT``): P is then just
+       half of the true period, which happens when a formant lands on an
+       even harmonic and the waveform nearly repeats at T/2 (the
+       octave-up trap);
+    3. accept P when every small multiple m·P also shows a peak
+       (``_TOL_MULT``): a spurious 2T/3T candidate has no peak chain at
+       the true-period multiples it would need;
+    4. the first survivor wins — the shortest valid lag is the
+       fundamental period.
+    """
+    n = len(a)
+    lag0, lag_last = int(lags[0]), int(lags[-1])
+    idx = [i for i in range(n)
+           if a[i] >= (a[i - 1] if i > 0 else -np.inf)
+           and a[i] >= (a[i + 1] if i < n - 1 else -np.inf) and a[i] > 0]
+    if not idx:
+        return None
+    m_max = float(a.max())
+    cands = sorted(i for i in idx if a[i] >= m_max - _TOL_PEAK)
+    if not cands:
+        cands = [max(idx, key=lambda i: a[i])]
+    for i in cands:
+        period = int(lags[i])
+        if 2 * period <= lag_last:
+            w2 = max(1, round(0.08 * period))
+            lo = max(0, 2 * period - w2 - lag0)
+            hi = min(n - 1, 2 * period + w2 - lag0)
+            if lo <= hi and a[lo:hi + 1].max() > a[i] + _DELTA_OCT:
+                continue  # half-period of a clearly stronger 2P peak
+        k_max = min(lag_last // period, 6)
+        if k_max < 2:
+            return i  # too long to verify multiples — take it on trust
+        ok = True
+        for m in range(1, k_max + 1):
+            center = m * period
+            wm = max(1, round(0.04 * center))
+            lo = max(0, center - wm - lag0)
+            hi = min(n - 1, center + wm - lag0)
+            if lo > hi or a[lo:hi + 1].max() < m_max - _TOL_MULT:
+                ok = False
+                break
+        if ok:
+            return i
+    return max(idx, key=lambda i: a[i])
+
+
 def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
              frame_length: int | None = None, hop_length: int | None = None,
              voicing_threshold: float = 0.35,
              energy_floor_db: float = -55.0) -> F0Track:
-    """Autocorrelation-based F0 tracker.
+    """Autocorrelation F0 tracker with octave-robust peak selection.
+
+    The NCCF is Boersma's (1993) window-corrected autocorrelation —
+    ``r(lag) = ACF(x·w)(lag) / ACF(w)(lag)``, normalised by ``r(0)`` —
+    computed over a window of 3 periods of ``fmin`` (Praat's convention).
+    Period selection runs on peaks of the temporally smoothed NCCF via
+    :func:`_select_period`; sub-sample precision comes from parabolic
+    interpolation on the raw NCCF.
 
     Parameters
     ----------
     fmin, fmax : pitch search range in Hz (60–500 covers adult speech).
     voicing_threshold : minimum normalised autocorrelation for a voiced frame.
     energy_floor_db : frames below this RMS dB are never voiced.
+    frame_length : analysis window in samples.  ``None`` uses
+        ``max(25 ms, 3/fmin)``; if given, it should be at least twice the
+        longest lag (``2·sr/fmin``) or the search range is clipped.
     """
+    # 3 periods of the lowest candidate F0, at least 25 ms: the NCCF at
+    # lags near 1/fmin needs >= 2 periods of overlap to be trustworthy.
+    if frame_length is None:
+        frame_length = max(round(sr * 0.025), int(np.ceil(3.0 * sr / fmin)))
     frame_length, hop_length = _defaults(sr, frame_length, hop_length)
     lag_min = max(2, int(np.floor(sr / fmax)))
-    lag_max = int(np.ceil(sr / fmin))
-    if lag_max >= frame_length:
-        lag_max = frame_length - 1
+    lag_max = min(int(np.ceil(sr / fmin)), frame_length // 2)
     if lag_min >= lag_max:
         raise ValueError("pitch search range does not fit the analysis frame")
 
@@ -136,58 +211,47 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
     rms_db = db(rms ** 2)
     active = rms_db > energy_floor_db
 
-    # normalised cross-correlation over the lag range, vectorised over frames.
-    # NCCF: r(lag) = sum x(t)x(t+lag) / sqrt(sum x(t)^2 * sum x(t+lag)^2)
-    # (over the overlapping region) so that perfectly periodic frames score 1.
     lags = np.arange(lag_min, lag_max + 1)
-    n_active = int(np.sum(active))
-    if n_active == 0:
+    act_idx = np.where(active)[0]
+    if len(act_idx) == 0:
         return F0Track(times=times, f0=f0, voiced=voiced)
 
-    act_idx = np.where(active)[0]
-    fx = frames[act_idx] - frames[act_idx].mean(axis=1, keepdims=True)
-    # cumulative energies for O(1) segment-energy lookups
-    cum = np.concatenate([np.zeros((n_active, 1)), np.cumsum(fx ** 2, axis=1)], axis=1)
+    # Window-corrected autocorrelation (Boersma 1993).  Dividing by the
+    # window's own autocorrelation undoes the taper, so a perfectly
+    # periodic frame scores ~1 at EVERY integer multiple of its period.
+    # The overlap-length normalisation used previously
+    # (num / sqrt(E_left·E_right)) inflates long lags — the shrinking
+    # overlap divides away more energy than the numerator loses — which
+    # systematically biased the global maximum towards 2T/3T.
+    w = np.hanning(frame_length)
+    fx = (frames[act_idx] - frames[act_idx].mean(axis=1, keepdims=True)) * w
+    n_fft = 1 << (2 * frame_length - 1).bit_length()
+    FX = np.fft.rfft(fx, n_fft, axis=1)
+    acf = np.fft.irfft(FX * np.conj(FX), n_fft, axis=1)
+    FW = np.fft.rfft(w, n_fft)
+    acf_w = np.fft.irfft(FW * np.conj(FW), n_fft)[:frame_length]
+    r = acf[:, lags] / np.maximum(acf_w[lags], 1e-12)
+    r0 = acf[:, 0] / max(acf_w[0], 1e-12)
+    nccf = r / np.maximum(r0, 1e-12)[:, None]
 
-    ac = np.empty((n_active, len(lags)), dtype=np.float64)
-    for j, lag in enumerate(lags):
-        num = np.einsum("ij,ij->i", fx[:, : frame_length - lag], fx[:, lag:])
-        e1 = cum[:, frame_length - lag]                       # energy of x[:N-lag]
-        e2 = cum[:, frame_length] - cum[:, lag]                # energy of x[lag:]
-        ac[:, j] = num / np.sqrt(np.maximum(e1 * e2, 1e-20))
+    # 3-frame temporal smoothing feeds only the octave decision: the
+    # half-period vs full-period NCCF contrast (~0.01) is the same order
+    # as per-frame noise, and averaging three frames recovers it.
+    sm = nccf.copy()
+    if len(sm) >= 3:
+        sm[1:-1] = (nccf[:-2] + nccf[1:-1] + nccf[2:]) / 3.0
 
-    for i, fi in enumerate(act_idx):
-        a = ac[i]
-        r_max = float(a.max())
-        if r_max < voicing_threshold:
+    for row, fi in enumerate(act_idx):
+        if float(sm[row].max()) < voicing_threshold:
             continue
-        # Autocorrelation of a periodic signal peaks at every integer
-        # multiple of the period.  Choosing the *shortest* lag within a
-        # tolerance of the maximum avoids subharmonic (octave-down) errors.
-        thr = 0.85 * r_max
-        j = int(np.argmax(a >= thr))
-        # Subharmonic rescue for amplitude-modulated voices: when consecutive
-        # periods differ in amplitude (tremor, quavering), the NCCF at the
-        # TRUE period drops (the compared segments differ in envelope) while
-        # the lag-2T peak stays ~1.0, so the scan above locks onto F0/2 and
-        # shimmer goes blind to the very perturbation it should measure
-        # (Praat's own tracker shares this failure mode).  If the NCCF at
-        # L/2 or L/3 is still high in absolute terms, the signal is
-        # near-periodic at the shorter lag — an AM signature — so prefer it.
-        # The absolute floor (0.75) sits well below the AM case (~0.84) and
-        # well above genuine low-F0 half-period correlations (<= ~0.55 on
-        # impulse/sawtooth sources; pure tones are negative there).
-        for div in (3, 2):
-            cand = round(lags[j] / div)
-            if cand >= lag_min:
-                jc = cand - lag_min
-                if a[jc] >= 0.75:
-                    j = jc
-                    break
-        # parabolic interpolation around the peak
+        j = _select_period(sm[row], lags)
+        if j is None:
+            continue
+        # parabolic interpolation on the raw (unsmoothed) NCCF
+        raw = nccf[row]
         lag_est = float(lags[j])
-        if 0 < j < len(a) - 1:
-            y0, y1, y2 = a[j - 1], a[j], a[j + 1]
+        if 0 < j < len(raw) - 1:
+            y0, y1, y2 = raw[j - 1], raw[j], raw[j + 1]
             denom_p = y0 - 2 * y1 + y2
             if abs(denom_p) > 1e-9:
                 lag_est = lags[j] + 0.5 * (y0 - y2) / denom_p
@@ -201,8 +265,7 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
 
         v_idx = np.where(voiced)[0]
         if len(v_idx) >= 3:
-            smoothed = medfilt(f0[v_idx], 3)
-            f0[v_idx] = smoothed
+            f0[v_idx] = medfilt(f0[v_idx], 3)
 
     return F0Track(times=times, f0=f0, voiced=voiced)
 
@@ -425,6 +488,14 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
     population-dependent (Praat's own docs stress the sustained-vowel
     requirement); treat them as research triage, not diagnosis.  Pass a
     precomputed ``track`` from :func:`f0_track` to avoid recomputing pitch.
+
+    Degenerate periodicity: amplitudes that repeat exactly every k periods
+    (strict pulse alternans, k = 2) shift the best waveform repetition to
+    F0/k — native Praat tracks such signals at the subharmonic and so does
+    this tracker, which then averages the loud/quiet pulses together and
+    under-reports shimmer.  Period-based perturbation measures are only
+    well-defined when the period itself is unambiguous; treat strict
+    alternation accordingly.
     """
     epochs, amps = _find_epochs(samples, sr, fmin, fmax, track=track)
     if len(epochs) < 3 or len(amps) < 2:
@@ -433,17 +504,27 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
 
     periods = np.diff(epochs) / sr
     jitter = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods) * 100.0)
+    return JitterShimmer(jitter_local_percent=jitter,
+                         shimmer_local_db=_shimmer_local_db(amps),
+                         n_periods=len(periods))
+
+
+def _shimmer_local_db(amps: np.ndarray) -> float:
+    """Praat's *shimmer (local, dB)* from per-period amplitudes.
+
+    The average of ``|20·log10(A_{k+1}/A_k)|`` over consecutive periods.
+    The absolute value must sit on the dB steps themselves: applied to the
+    signed values (or omitted) the average telescopes down to
+    ``20·log10(A_last/A_first)`` — a signal whose amplitudes swing
+    1 → 2 → 1 → 2 … would report ~0 dB instead of 6.02 dB, measuring
+    envelope drift rather than cycle-to-cycle perturbation.
+    """
+    amps = np.asarray(amps, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        # Praat's Shimmer (local, dB): the *absolute* log change between
-        # consecutive periods, averaged.  The abs must sit on the dB values:
-        # without it, rises and falls cancel and the sum telescopes down to
-        # log10(last/first) — measuring the envelope drift, not perturbation.
         amp_ratios = amps[1:] / np.where(np.abs(amps[:-1]) < 1e-12, np.nan, amps[:-1])
         db_steps = 20.0 * np.log10(amp_ratios)
-        shimmer = float(np.nanmean(np.abs(db_steps))) \
+        return float(np.nanmean(np.abs(db_steps))) \
             if np.any(np.isfinite(db_steps)) else float("nan")
-    return JitterShimmer(jitter_local_percent=jitter,
-                         shimmer_local_db=shimmer, n_periods=len(periods))
 
 
 def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
