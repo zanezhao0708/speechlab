@@ -159,8 +159,10 @@ Configuration via environment variables:
 | `SPEECHLAB_REDACT_PATHS`   | off                        |
 
 The system prompt instructs the agent to always measure before
-interpreting, report units (Hz, dB, ms, %) with normal ranges, and
-distinguish established results from hypotheses.
+interpreting, report units (Hz, dB, ms, %) with reference ranges, and
+present jitter/shimmer/HNR thresholds as algorithm-, recording- and
+population-dependent screening values (research triage, not diagnosis),
+deferring clinical decisions to certified professionals.
 
 ## Privacy & security boundaries
 
@@ -216,8 +218,12 @@ certified professionals.
   (quarter-period smoothing suppresses formant ripple), local
   period-to-period and amplitude perturbation. Computed on the longest
   sustained voiced segment when one exists — perturbation norms assume a
-  sustained vowel, not connected speech.
-- **HNR**: autocorrelation-based, `10·log10(r/(1−r))` at the tracked F0 lag.
+  sustained vowel, not connected speech. Known limit: the epoch walk
+  confines consecutive periods to [0.75, 1.25]× the median period, so
+  extremely rough (pathological) voices are underestimated.
+- **HNR**: autocorrelation-based, `10·log10(r/(1−r))` at the tracked F0
+  lag, over the same sustained voiced segment as jitter/shimmer; frames
+  with no positive periodicity are skipped (undefined, as in Praat).
 - **Temporal structure**: energy-gated pauses (≥0.2 s) and a syllable-nuclei
   estimate from smoothed energy peaks requiring both a minimum prominence
   over the adjacent valleys and ≥120 ms spacing (de Jong & Wempe style) —

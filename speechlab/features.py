@@ -166,6 +166,24 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
         # tolerance of the maximum avoids subharmonic (octave-down) errors.
         thr = 0.85 * r_max
         j = int(np.argmax(a >= thr))
+        # Subharmonic rescue for amplitude-modulated voices: when consecutive
+        # periods differ in amplitude (tremor, quavering), the NCCF at the
+        # TRUE period drops (the compared segments differ in envelope) while
+        # the lag-2T peak stays ~1.0, so the scan above locks onto F0/2 and
+        # shimmer goes blind to the very perturbation it should measure
+        # (Praat's own tracker shares this failure mode).  If the NCCF at
+        # L/2 or L/3 is still high in absolute terms, the signal is
+        # near-periodic at the shorter lag — an AM signature — so prefer it.
+        # The absolute floor (0.75) sits well below the AM case (~0.84) and
+        # well above genuine low-F0 half-period correlations (<= ~0.55 on
+        # impulse/sawtooth sources; pure tones are negative there).
+        for div in (3, 2):
+            cand = round(lags[j] / div)
+            if cand >= lag_min:
+                jc = cand - lag_min
+                if a[jc] >= 0.75:
+                    j = jc
+                    break
         # parabolic interpolation around the peak
         lag_est = float(lags[j])
         if 0 < j < len(a) - 1:
@@ -297,7 +315,16 @@ def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
     low-pass smoothed over a quarter period to suppress formant ripple, and
     peaks are then picked with a minimum spacing of 0.6·period.
 
-    Returns ``(epoch_indices, peak_amplitudes)``.
+    Returns ``(epoch_indices, period_amplitudes)`` where
+    ``period_amplitudes[k]`` is the peak-to-peak swing of the raw signal
+    over period ``k``.  Epochs (smoothed-waveform peaks) lag the true
+    excitation by a roughly constant offset, so a window from one epoch to
+    the next straddles the period boundary: it mixes the current period's
+    decay with the next period's onset and attenuates exactly the
+    cycle-to-cycle amplitude contrast shimmer is supposed to measure.
+    Amplitudes are therefore taken between the *attacks* — the sharpest
+    waveform slopes preceding each epoch — which track the actual glottal
+    periods (as Praat's PointProcess pulses do).
     """
     x = np.asarray(samples, dtype=np.float64)
     if len(x) < int(sr / fmin) * 3:
@@ -322,31 +349,63 @@ def _find_epochs(samples: np.ndarray, sr: int, fmin: float = 60.0,
     kernel = kernel / kernel.sum() if kernel.sum() > 0 else kernel
     xs = np.convolve(x, kernel, mode="same")
 
-    min_dist = max(2, round(0.6 * period))
     threshold = 0.1 * np.max(np.abs(xs))
     epochs: list[int] = []
-    i = 1
     n = len(xs)
-    while i < n - 1:
-        is_peak = xs[i] > threshold and xs[i] >= xs[i - 1] and xs[i] > xs[i + 1]
-        if is_peak and (not epochs or i - epochs[-1] >= min_dist):
+
+    # seed with the first local maximum above threshold, then walk: the
+    # next epoch is the waveform maximum inside [0.75, 1.25]·period after
+    # the last one.  Taking the window maximum (rather than the first
+    # above-threshold peak) avoids locking onto formant ringing between
+    # glottal pulses, which used to split periods and inflate jitter and
+    # shimmer on impulse-excited vowels.
+    i = 1
+    while i < n - 1 and not epochs:
+        if xs[i] > threshold and xs[i] >= xs[i - 1] and xs[i] > xs[i + 1]:
             epochs.append(i)
-            i += min_dist
-            continue
         i += 1
+    if epochs:
+        lo = max(1, round(0.75 * period))
+        hi = max(lo + 1, round(1.25 * period))
+        anchor = epochs[0]
+        while anchor + hi <= n:  # only full windows: a clipped final
+            w0 = anchor + lo     # window max is a ringing tail, not a pulse
+            j = int(np.argmax(xs[w0:anchor + hi]))
+            if xs[w0 + j] > threshold:
+                epochs.append(w0 + j)
+                anchor = w0 + j
+            else:  # silent stretch: skip a window, resync afterwards
+                anchor += hi
 
     epochs_arr = np.asarray(epochs, dtype=int)
     if len(epochs_arr) >= 2:
-        # drop periods outside the plausible F0 range
+        # drop periods outside a *toleranced* plausible F0 range.  Strict
+        # bounds flicker for signals sitting on the fmin/fmax edge (a
+        # 60 Hz-tracked epoch train has periods straddling 1/fmin) and
+        # mangle the epoch set instead of gating it.
         periods = np.diff(epochs_arr) / sr
-        good = (periods >= 1.0 / fmax) & (periods <= 1.0 / fmin)
+        good = (periods >= 0.8 / fmax) & (periods <= 1.25 / fmin)
         if not np.all(good):
             keep = [epochs_arr[0]]
             for k in range(1, len(epochs_arr)):
                 if good[k - 1]:
                     keep.append(epochs_arr[k])
             epochs_arr = np.asarray(keep, dtype=int)
-    return epochs_arr, x[epochs_arr] if len(epochs_arr) else np.empty(0)
+    if len(epochs_arr) < 2:
+        return epochs_arr, np.empty(0)
+    # robust per-period amplitude: the full swing between consecutive
+    # *attacks* (sharpest slopes), not between the smoothed-peak epochs —
+    # see the docstring for why the epoch-to-epoch window leaks the next
+    # period's onset into the current period's amplitude.
+    half = round(0.5 * period)
+    attacks = np.empty(len(epochs_arr), dtype=int)
+    for k, e in enumerate(epochs_arr):
+        lo = max(0, e - half)
+        seg = np.abs(np.diff(x[lo:e + 1]))
+        attacks[k] = lo + int(np.argmax(seg)) + 1 if len(seg) else e
+    amps = np.array([float(np.ptp(x[attacks[k]:max(attacks[k] + 1, attacks[k + 1])]))
+                     for k in range(len(attacks) - 1)])
+    return epochs_arr, amps
 
 
 def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
@@ -354,21 +413,35 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
                    track: F0Track | None = None) -> JitterShimmer:
     """Local jitter (%) and shimmer (dB) from consecutive glottal periods.
 
-    Typical sustained-vowel values: jitter < 1 %, shimmer < 0.4 dB indicate
-    a healthy voice; both rise with vocal pathology.  Pass a precomputed
-    ``track`` from :func:`f0_track` to avoid recomputing pitch.
+    Jitter follows Praat's *jitter (local)*: the average absolute difference
+    between consecutive periods, divided by the mean period.  Shimmer
+    follows *shimmer (local, dB)*: the average of ``|20·log10(A_{k+1}/A_k)|``
+    over consecutive periods, with ``A`` the peak-to-peak amplitude inside
+    each period (validated against native Praat on perturbed synthetic
+    vowels; see ``benchmarks/praat_benchmark.py``).
+
+    Commonly cited sustained-vowel screening values are jitter < 1 %,
+    shimmer < 0.4 dB — but these thresholds are algorithm-, recording- and
+    population-dependent (Praat's own docs stress the sustained-vowel
+    requirement); treat them as research triage, not diagnosis.  Pass a
+    precomputed ``track`` from :func:`f0_track` to avoid recomputing pitch.
     """
-    epochs, peaks = _find_epochs(samples, sr, fmin, fmax, track=track)
-    if len(epochs) < 3:
+    epochs, amps = _find_epochs(samples, sr, fmin, fmax, track=track)
+    if len(epochs) < 3 or len(amps) < 2:
         return JitterShimmer(jitter_local_percent=float("nan"),
                              shimmer_local_db=float("nan"), n_periods=0)
 
     periods = np.diff(epochs) / sr
     jitter = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods) * 100.0)
     with np.errstate(divide="ignore", invalid="ignore"):
-        amp_ratios = peaks[1:] / np.where(np.abs(peaks[:-1]) < 1e-12, np.nan, peaks[:-1])
-        shimmer = 20.0 * np.log10(np.abs(amp_ratios))
-        shimmer = float(np.nanmean(shimmer)) if np.any(np.isfinite(shimmer)) else float("nan")
+        # Praat's Shimmer (local, dB): the *absolute* log change between
+        # consecutive periods, averaged.  The abs must sit on the dB values:
+        # without it, rises and falls cancel and the sum telescopes down to
+        # log10(last/first) — measuring the envelope drift, not perturbation.
+        amp_ratios = amps[1:] / np.where(np.abs(amps[:-1]) < 1e-12, np.nan, amps[:-1])
+        db_steps = 20.0 * np.log10(amp_ratios)
+        shimmer = float(np.nanmean(np.abs(db_steps))) \
+            if np.any(np.isfinite(db_steps)) else float("nan")
     return JitterShimmer(jitter_local_percent=jitter,
                          shimmer_local_db=shimmer, n_periods=len(periods))
 
@@ -408,7 +481,13 @@ def hnr(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
         e1 = float(np.sum(fx[:-lag] ** 2))
         e2 = float(np.sum(fx[lag:] ** 2))
         r_val = num / max(np.sqrt(e1 * e2), 1e-20)
-        r_val = min(max(r_val, 1e-6), 0.999999)
+        # r <= 0 means no periodicity evidence at all: Praat reports
+        # "undefined" for such frames.  Clamping them to r = 1e-6 instead
+        # would inject a made-up -60 dB into the average and drag the
+        # summary down arbitrarily — skip them like Praat does.
+        if r_val <= 0.0:
+            continue
+        r_val = min(r_val, 0.999999)
         vals.append(10.0 * np.log10(r_val / (1.0 - r_val)))
     return float(np.mean(vals)) if vals else float("nan")
 
@@ -788,14 +867,18 @@ def diarize(audio: AudioData, n_speakers: int = 2, min_turn_s: float = 0.4,
 # statistical comparison of two analyses
 # --------------------------------------------------------------------------
 
-#: literature-derived screening ranges (adults, sustained vowel, unless noted)
+#: commonly cited screening ranges (adults, sustained vowel, unless noted).
+#: Research triage only: jitter/shimmer/HNR thresholds are algorithm-,
+#: recording- and population-dependent — they are not diagnostic criteria.
 _NORMS: dict[str, dict] = {
     "f0_hz": {"men": (85, 180), "women": (165, 255), "children": (250, 350),
               "note": "modal speaking pitch"},
     "jitter_percent": {"typical": (0.0, 1.0), "borderline": (1.0, 1.5),
-                       "note": "local jitter, sustained vowel (PRAAT norms)"},
+                       "note": "local jitter, sustained vowel; thresholds "
+                               "are algorithm- and population-dependent"},
     "shimmer_db": {"typical": (0.0, 0.35), "borderline": (0.35, 0.7),
-                   "note": "local shimmer, sustained vowel"},
+                   "note": "local shimmer, sustained vowel; thresholds "
+                           "are algorithm- and population-dependent"},
     "hnr_db": {"typical": (20.0, 45.0), "borderline": (15.0, 20.0),
                "note": ">20 dB suggests stable phonation"},
     "snr_db": {"typical": (30.0, 60.0), "note": "recording quality target"},
@@ -817,8 +900,8 @@ def reference_ranges(metric: str = "") -> dict:
 def compare_reports(a: dict, b: dict) -> dict:
     """Compare two analyze() reports with inferential statistics.
 
-    Welch t-test (F0 contour samples where available), Cohen's d effect
-    sizes for scalar summaries, normative grading for each side.
+    Welch t-test (F0 contour samples where available) and Cohen's d effect
+    sizes for scalar summaries.
     """
     from scipy import stats
 
@@ -859,13 +942,26 @@ def compare_reports(a: dict, b: dict) -> dict:
         fa = np.array([v for v in ca["f0_hz"] if v is not None], dtype=float)
         fb = np.array([v for v in cb["f0_hz"] if v is not None], dtype=float)
         if len(fa) >= 5 and len(fb) >= 5:
-            t, p = stats.ttest_ind(fa, fb, equal_var=False)
-            dof = len(fa) + len(fb) - 2
+            res = stats.ttest_ind(fa, fb, equal_var=False)
+            t, p = float(res.statistic), float(res.pvalue)
+            # Welch–Satterthwaite df.  n1+n2-2 would be the *pooled*-variance
+            # df — reporting it under a "Welch" label is the statistical
+            # twin of the shimmer sign bug: a plausible number from the
+            # wrong formula.  scipy computes it for us; fall back to the
+            # textbook formula only for very old scipy.
+            dof = getattr(res, "df", None)
+            if dof is None:
+                va, vb = np.var(fa, ddof=1), np.var(fb, ddof=1)
+                wa, wb = va / len(fa), vb / len(fb)
+                dof = (wa + wb) ** 2 / (wa ** 2 / (len(fa) - 1)
+                                        + wb ** 2 / (len(fb) - 1))
             out["f0_ttest"] = {
-                "t": round(float(t), 2), "p": float(p),
-                "df": int(dof), "n_a": len(fa), "n_b": len(fb),
+                "t": round(t, 2), "p": float(p),
+                "df": round(float(dof), 1), "n_a": len(fa), "n_b": len(fb),
                 "significant_5pct": bool(p < 0.05),
-                "note": "Welch t-test on per-frame F0 samples of both files",
+                "note": ("Welch t-test on per-frame F0 samples; consecutive "
+                         "frames are temporally autocorrelated, so treat p "
+                         "as approximate (anti-conservative)"),
             }
     if not rows and "f0_ttest" not in out:
         out["error"] = "no comparable metrics between the two reports"
@@ -931,18 +1027,21 @@ def analyze(audio: AudioData, contour: bool = False,
     track = f0_track(x, sr)
     segs = voiced_segments(track)
     if segs:
-        # clinical perturbation measures assume a sustained vowel: prefer the
+        # perturbation/HNR norms are sustained-vowel measures: prefer the
         # longest contiguous voiced stretch over the whole (possibly
-        # connected-speech) recording
+        # connected-speech) recording — and use the *same* segment for
+        # jitter/shimmer and HNR so the three numbers describe one signal
         seg = max(segs, key=lambda s: s["end_s"] - s["start_s"])
         i0, i1 = int(seg["start_s"] * sr), min(int(seg["end_s"] * sr) + 1, len(x))
         sub_x = x[i0:i1]
         m = (track.times >= seg["start_s"]) & (track.times <= seg["end_s"])
         sub_track = F0Track(times=track.times[m], f0=track.f0[m], voiced=track.voiced[m])
         js = jitter_shimmer(sub_x, sr, track=sub_track)
+        hnr_db = hnr(sub_x, sr, track=sub_track)
         js_segment = seg
     else:
         js = jitter_shimmer(x, sr, track=track)
+        hnr_db = hnr(x, sr, track=track)
         js_segment = None
 
     # ---- formants: voiced frames only, analysed at 2× the ceiling rate.
@@ -1002,7 +1101,7 @@ def analyze(audio: AudioData, contour: bool = False,
         "voice_quality": js.summary(),
         "voice_quality_segment_s": (js_segment["start_s"], js_segment["end_s"])
                                    if js_segment else None,
-        "hnr_db": round(hnr(x, sr, track=track), 2) if len(x) else float("nan"),
+        "hnr_db": round(hnr_db, 2) if len(x) else float("nan"),
         "formants": formant_summary,
         "recording_quality": recording_quality(x, sr),
         "voiced_segments": segs,

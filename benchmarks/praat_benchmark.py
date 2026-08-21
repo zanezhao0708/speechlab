@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 import json
 import math
 import os
@@ -69,41 +68,6 @@ AUDIO_EXT = {".wav", ".wave", ".flac", ".mp3", ".ogg"}
 # Praat reference measurements
 # ---------------------------------------------------------------------------
 
-def _praat_shimmer_db(snd, pp) -> float:
-    """Local shimmer (dB) from epoch peak amplitudes.
-
-    Praat's definition: over consecutive glottal periods, the mean of
-    |20·log10(A[i+1]/A[i])| where A[i] is the peak-to-peak amplitude within
-    period i.  Reproduced here because recent parselmouth builds only
-    register the ratio command.
-    """
-    n_points = int(parselmouth.praat.call(pp, "Get number of points"))
-    if n_points < 3:
-        return float("nan")
-    times = np.array([parselmouth.praat.call(pp, "Get time from index", i + 1)
-                      for i in range(n_points)])
-    x = np.asarray(snd.values).ravel()
-    sr = snd.sampling_frequency
-    amps = []
-    for t0, t1 in itertools.pairwise(times):
-        if t1 - t0 < 0.0001 or t1 - t0 > 0.02:  # Praat's period bounds
-            amps.append(np.nan)
-            continue
-        i0, i1 = int(t0 * sr), int(t1 * sr)
-        if i1 <= i0 or i1 > len(x):
-            amps.append(np.nan)
-            continue
-        seg = x[i0:i1]
-        amps.append(float(np.max(seg) - np.min(seg)))
-    amps = np.asarray(amps)
-    ok = ~np.isnan(amps[:-1]) & ~np.isnan(amps[1:]) & (amps[:-1] > 0) \
-        & (amps[1:] > 0)
-    if np.sum(ok) < 3:
-        return float("nan")
-    ratios = np.abs(20.0 * np.log10(amps[1:][ok] / amps[:-1][ok]))
-    return float(np.mean(ratios))
-
-
 def praat_reference(path: str, fmin: float, fmax: float,
                     formant_max: float) -> dict:
     """Praat's own numbers for one file (parselmouth bindings)."""
@@ -124,13 +88,16 @@ def praat_reference(path: str, fmin: float, fmax: float,
             if not math.isnan(v) and v > 0:
                 f_vals[n].append(v)
 
-    pp = parselmouth.praat.call(pitch, "To PointProcess")
+    # PointProcess built from the Sound (not from the Pitch): the Praat
+    # manual warns that Pitch -> To PointProcess leaves pulses unaligned
+    # with the waveform periods, which corrupts shimmer's amplitude
+    # windows.  Shimmer/jitter use Praat's own commands.
+    pp = parselmouth.praat.call(snd, "To PointProcess (periodic, cc)",
+                                fmin, fmax)
     jitter = parselmouth.praat.call(
         pp, "Get jitter (local)", 0.0, 0.0, 0.0001, 0.02, 1.3) * 100.0
-    # Current Praat builds only register the ratio command; the local-dB
-    # variant is computed here from epoch peak amplitudes, which is exactly
-    # Praat's definition: mean over periods of |20·log10(A[i+1]/A[i])|.
-    shimmer = _praat_shimmer_db(snd, pp)
+    shimmer = parselmouth.praat.call(
+        [snd, pp], "Get shimmer (local_dB)", 0.0, 0.0, 0.0001, 0.02, 1.3, 1.6)
     harm = parselmouth.praat.call(snd, "To Harmonicity (cc)", 0.01, fmin, 0.1, 1.0)
     hv = np.asarray(harm.values).ravel()
     hv = hv[hv > -200]  # Praat's "undefined" sentinel

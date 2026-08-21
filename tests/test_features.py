@@ -12,7 +12,7 @@ from speechlab.features import (
     jitter_shimmer,
 )
 
-from .helpers import noise, tone, vowel_like, write_wav
+from .helpers import noise, perturbed_vowel, tone, vowel_like, write_wav
 
 
 # --------------------------------------------------------------------- pitch
@@ -78,6 +78,75 @@ def test_jitter_shimmer_too_short():
     js = jitter_shimmer(np.zeros(100), 16000)
     assert js.n_periods == 0
     assert np.isnan(js.jitter_local_percent)
+
+
+# ------------------------------------------- adversarial perturbation tests
+# Stable-signal tests above prove the estimators do not explode; the tests
+# here prove they actually *respond* to perturbation — the failure mode the
+# old shimmer implementation hid for months: sign-cancelling dB steps made
+# every perturbed voice look calm (see the telescoping comment in
+# features.jitter_shimmer).
+def test_shimmer_alternating_amplitude_is_large():
+    """Reviewer's counter-example: 1 -> 2 -> 1 -> 2 amplitude.
+
+    Every consecutive period differs by 2x, so shimmer (local, dB) must be
+    large.  Two bugs used to report ~0 dB on exactly this signal: the
+    sign-cancellation in the dB average, and the F0 tracker locking onto
+    the 60 Hz subharmonic (period-doubling makes AM signals look periodic
+    at F0/2), which sampled every other period and averaged the loud and
+    quiet pulses together.  The measured value is ~4.7 dB rather than
+    20·log10(2) = 6.0 dB because the 80 Hz-bandwidth formants smear the
+    amplitude contrast across neighbouring periods; 3 dB leaves margin on
+    both sides.
+    """
+    sr = 16000
+    x = perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
+                        amp_factors=(1.0, 2.0))
+    js = jitter_shimmer(x, sr)
+    assert js.n_periods > 50
+    assert js.shimmer_local_db > 3.0
+
+
+def test_shimmer_ignores_slow_envelope_drift():
+    """Anti-telescoping: first/last amplitude differing must NOT count.
+
+    A slow 0.5 -> 1.0 ramp changes each period by ~0.6 %, so true shimmer
+    is < 0.5 dB even though the envelope rises 6 dB overall.  The buggy
+    telescoping sum measured the overall 6 dB drift instead.
+    """
+    sr = 16000
+    n_periods = 120
+    ramp = np.linspace(0.5, 1.0, n_periods)
+    x = perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
+                        amp_factors=ramp)
+    js = jitter_shimmer(x, sr)
+    assert js.shimmer_local_db < 0.5
+
+
+def test_shimmer_rises_with_random_amplitude_perturbation():
+    """±15 % cycle-to-cycle amplitude noise must raise shimmer clearly."""
+    sr = 16000
+    rng = np.random.default_rng(5)
+    clean = jitter_shimmer(perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr), sr)
+    rough = jitter_shimmer(
+        perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
+                        amp_factors=rng.normal(1.0, 0.15, 200)), sr)
+    assert rough.shimmer_local_db > clean.shimmer_local_db + 0.5
+    # E|20·log10(1+ε)| ≈ 8.686·0.15·√2·0.8 ≈ 1.5 dB
+    assert rough.shimmer_local_db > 1.0
+
+
+def test_jitter_rises_with_period_perturbation():
+    """±8 % cycle-to-cycle period noise must raise jitter clearly."""
+    sr = 16000
+    rng = np.random.default_rng(6)
+    clean = jitter_shimmer(perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr), sr)
+    rough = jitter_shimmer(
+        perturbed_vowel(f0_hz=120.0, duration_s=1.0, sr=sr,
+                        period_factors=rng.normal(1.0, 0.08, 200)), sr)
+    assert rough.jitter_local_percent > clean.jitter_local_percent + 2.0
+    # amplitude was untouched: shimmer must not move much
+    assert rough.shimmer_local_db < clean.shimmer_local_db + 1.0
 
 
 def test_hnr_tone_high_noise_low():
