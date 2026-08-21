@@ -10,6 +10,11 @@ Configuration (environment variables):
 * ``SPEECHLAB_API_KEY``   — API key (required to use the agent).
 * ``SPEECHLAB_BASE_URL``  — endpoint base URL, default OpenAI.
 * ``SPEECHLAB_MODEL``     — model name, default ``gpt-4o-mini``.
+* ``SPEECHLAB_ALLOWED_DIRS`` — path sandbox for the file tools: an
+  ``os.pathsep``-separated list of directories the agent may read
+  audio from.  Default: the current working directory.
+* ``SPEECHLAB_REDACT_PATHS`` — set to ``1`` to strip directory parts
+  from file paths in tool results before they are sent to the API.
 """
 
 from __future__ import annotations
@@ -32,7 +37,14 @@ from .features import compare_reports as _compare_reports
 from .features import diarize as _diarize
 from .features import reference_ranges as _reference_ranges
 
-__all__ = ["RESEARCH_SYSTEM_PROMPT", "AgentConfig", "SpeechResearchAgent", "build_tool_specs"]
+__all__ = [
+    "RESEARCH_SYSTEM_PROMPT",
+    "AgentConfig",
+    "SpeechResearchAgent",
+    "build_tool_specs",
+    "redact_path",
+    "resolve_tool_path",
+]
 
 RESEARCH_SYSTEM_PROMPT = """\
 You are SpeechLab Agent, a research assistant for speech science and speech
@@ -69,6 +81,54 @@ Available tools beyond analyze_audio:
 """
 
 
+def _default_allowed_dirs() -> list[str]:
+    """Allowed directories for the file tools: SPEECHLAB_ALLOWED_DIRS or cwd."""
+    env = os.environ.get("SPEECHLAB_ALLOWED_DIRS", "")
+    dirs = [d for d in env.split(os.pathsep) if d]
+    return dirs or [os.getcwd()]
+
+
+def resolve_tool_path(path: str, allowed_dirs: list[str]) -> str:
+    """Resolve a model-supplied path inside the sandbox; fail closed.
+
+    Relative paths resolve against the first allowed directory (the
+    "workspace"); every path — absolute or relative — must resolve
+    *including symlinks* inside one of ``allowed_dirs``, otherwise a
+    ``PermissionError`` is raised before any file is read.  Symlinks are
+    resolved on both sides, so a link stored inside the workspace but
+    pointing outside does not open an escape hatch.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        raise ValueError("path must be a non-empty string")
+    roots = [os.path.realpath(d) for d in allowed_dirs]
+    if not roots:
+        raise PermissionError("no allowed directories configured")
+    expanded = os.path.expanduser(raw)
+    candidate = expanded if os.path.isabs(expanded) else os.path.join(roots[0], expanded)
+    real = os.path.realpath(candidate)
+    for root in roots:
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return real
+    raise PermissionError(
+        f"access denied: {raw!r} is outside the allowed directories "
+        f"[{', '.join(roots)}]; place the audio inside the workspace or "
+        "extend SPEECHLAB_ALLOWED_DIRS"
+    )
+
+
+def redact_path(path: str | None) -> str | None:
+    """Reduce a filesystem path to ``…/<basename>`` for privacy.
+
+    Tool results travel to the LLM API; directory names can carry
+    sensitive information (user names, study/patient identifiers), so
+    :class:`AgentConfig` can strip them.
+    """
+    if not path:
+        return path
+    return "…/" + os.path.basename(str(path).rstrip("/\\"))
+
+
 @dataclass
 class AgentConfig:
     """Connection settings for an OpenAI-compatible chat API."""
@@ -91,6 +151,15 @@ class AgentConfig:
     """Base backoff delay; doubles after each failed attempt."""
     max_history_chars: int = 40_000
     """Rough history budget: older messages are dropped to stay under it."""
+    allowed_dirs: list[str] = field(default_factory=_default_allowed_dirs)
+    """Path sandbox: the only directories the file tools may read from.
+    Defaults to ``SPEECHLAB_ALLOWED_DIRS`` (``os.pathsep``-separated)
+    or the current working directory."""
+    redact_paths: bool = field(
+        default_factory=lambda: os.environ.get("SPEECHLAB_REDACT_PATHS", "")
+        .strip().lower() in ("1", "true", "yes", "on"))
+    """Privacy: replace directory parts of file paths in tool results
+    with ``…/<basename>`` before anything is sent to the LLM API."""
 
     def validate(self) -> None:
         if not self.api_key:
@@ -109,12 +178,16 @@ def build_tool_specs() -> list[dict]:
                 "name": "analyze_audio",
                 "description": (
                     "Acoustic analysis of one audio file: duration, F0 statistics, "
-                    "jitter/shimmer, HNR, formants, pauses and speech rate."
+                    "jitter/shimmer, HNR, formants (median F1-F3 with per-formant "
+                    "frame counts, IQR spread and confidence), pauses and speech "
+                    "rate. Interpret formant values with low confidence cautiously."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "path to the audio file"},
+                        "path": {"type": "string", "description": (
+                            "path to the audio file; must be inside the "
+                            "agent's allowed workspace directories")},
                     },
                     "required": ["path"],
                 },
@@ -132,8 +205,12 @@ def build_tool_specs() -> list[dict]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path_a": {"type": "string", "description": "first audio file (baseline)"},
-                        "path_b": {"type": "string", "description": "second audio file (condition)"},
+                        "path_a": {"type": "string", "description": (
+                            "first audio file (baseline); inside the allowed "
+                            "workspace directories")},
+                        "path_b": {"type": "string", "description": (
+                            "second audio file (condition); inside the allowed "
+                            "workspace directories")},
                     },
                     "required": ["path_a", "path_b"],
                 },
@@ -151,7 +228,9 @@ def build_tool_specs() -> list[dict]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "path to the audio file"},
+                        "path": {"type": "string", "description": (
+                            "path to the audio file; must be inside the "
+                            "agent's allowed workspace directories")},
                         "n_speakers": {
                             "type": "integer",
                             "description": "number of speakers, 0 = auto-detect",
@@ -172,7 +251,9 @@ def build_tool_specs() -> list[dict]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "path to the audio file"},
+                        "path": {"type": "string", "description": (
+                            "path to the audio file; must be inside the "
+                            "agent's allowed workspace directories")},
                         "language": {
                             "type": "string",
                             "description": "ISO-639-1 language hint, e.g. 'zh', 'en' (optional)",
@@ -247,24 +328,66 @@ class SpeechResearchAgent:
     # ------------------------------------------------------------------
     # local tools the model can call
     # ------------------------------------------------------------------
-    @staticmethod
-    def default_tools() -> dict[str, Callable[[dict], Any]]:
+    def default_tools(self) -> dict[str, Callable[[dict], Any]]:
+        """Default local tools, sandboxed to ``config.allowed_dirs``.
+
+        Every model-supplied path is resolved through
+        :func:`resolve_tool_path` before the filesystem is read, so a
+        confused or prompt-injected model cannot point the tools at
+        files outside the workspace.  With ``config.redact_paths`` the
+        directory parts of paths are stripped from results before they
+        are sent to the LLM API.
+        """
+        cfg = self.config
+
+        def _resolve(raw: str) -> str:
+            return resolve_tool_path(raw, cfg.allowed_dirs)
+
+        def _display(path: str) -> str:
+            return str(redact_path(path) if cfg.redact_paths else path)
+
+        def _resolve_checked(raw: str) -> tuple[str, str]:
+            """(real_path, display_path) after sandbox + existence checks."""
+            real = _resolve(raw)
+            shown = _display(real)
+            if not os.path.isfile(real):
+                raise FileNotFoundError(f"no such file: {shown}")
+            return real, shown
+
+        def _load(raw: str):
+            real, shown = _resolve_checked(raw)
+            try:
+                return load_audio(real)
+            except Exception as exc:  # rewrite path, keep type
+                msg = str(exc)
+                if cfg.redact_paths and real and real in msg:
+                    try:
+                        raise type(exc)(msg.replace(real, shown)) from exc
+                    except TypeError:  # exotic constructor signature
+                        raise RuntimeError(msg.replace(real, shown)) from exc
+                raise
+
         def analyze_audio(args: dict) -> dict:
-            return _analyze_audio(load_audio(args["path"]))
+            audio = _load(args["path"])
+            report = _analyze_audio(audio)
+            report["file"] = _display(str(audio.path or args["path"]))
+            return report
 
         def compare_audio(args: dict) -> dict:
-            ra = _analyze_audio(load_audio(args["path_a"]), contour=True)
-            rb = _analyze_audio(load_audio(args["path_b"]), contour=True)
-            out = _compare_reports(ra, rb)
-            out["files"] = [args["path_a"], args["path_b"]]
+            a = _load(args["path_a"])
+            b = _load(args["path_b"])
+            out = _compare_reports(_analyze_audio(a, contour=True),
+                                   _analyze_audio(b, contour=True))
+            out["files"] = [_display(str(a.path)), _display(str(b.path))]
             return out
 
         def diarize_audio(args: dict) -> dict:
-            return _diarize(load_audio(args["path"]),
+            return _diarize(_load(args["path"]),
                             n_speakers=int(args.get("n_speakers") or 0))
 
         def transcribe_audio(args: dict) -> dict:
-            return _transcribe(args["path"], language=args.get("language"))
+            real, _ = _resolve_checked(args["path"])
+            return _transcribe(real, language=args.get("language"))
 
         def reference_ranges(args: dict) -> dict:
             return _reference_ranges(args.get("metric", ""))

@@ -100,7 +100,56 @@ def test_analyze_end_to_end(tmp_path):
     assert report["sample_rate_hz"] == 16000
     assert report["pitch"]["f0_median_hz"] == pytest.approx(140.0, rel=0.05)
     assert report["voice_quality"]["n_periods"] > 30
-    assert set(report["formants"]) == {"F1_hz", "F2_hz", "F3_hz"}
+    assert {"F1_hz", "F2_hz", "F3_hz"} <= set(report["formants"])
+    assert "formant_track" not in report  # full track only with contour=True
+
+
+def test_formant_confidence_metrics():
+    """The report states how much to trust each formant median."""
+    sr = 16000
+    x = vowel_like(f0_hz=120.0, duration_s=0.5, sr=sr)
+    fmt = analyze(AudioData(samples=x, sample_rate=sr, path=None))["formants"]
+    assert fmt["n_frames"] >= 5
+    for k in ("F1", "F2", "F3"):
+        assert 0.0 <= fmt["confidence"][k] <= 1.0
+        assert fmt[f"{k}_iqr_hz"] >= 0.0
+    # a clean synthetic vowel is exactly what LPC is built for: the
+    # frame-wise F1 estimates should agree tightly
+    assert fmt["confidence"]["F1"] >= 0.6
+
+
+def test_formant_confidence_drops_when_estimate_scatters():
+    """A moving formant must yield lower confidence than a steady one."""
+    sr = 16000
+    steady = vowel_like(f0_hz=120.0, duration_s=0.6, sr=sr,
+                        formants=((600.0, 1.0), (1500.0, 0.6), (2440.0, 0.3)))
+    # F1 steps 400 -> 800 Hz in short steady blocks: whichever frames the
+    # energetic-half selection picks, they cannot agree on one F1
+    blocks = [vowel_like(f0_hz=120.0, duration_s=0.06, sr=sr,
+                         formants=((f1, 1.0), (1500.0, 0.6), (2440.0, 0.3)))
+              for f1 in np.linspace(400.0, 800.0, 10)]
+    moving = np.concatenate(blocks)
+
+    s = analyze(AudioData(samples=steady, sample_rate=sr, path=None))["formants"]
+    m = analyze(AudioData(samples=moving, sample_rate=sr, path=None))["formants"]
+    assert m["F1_iqr_hz"] > s["F1_iqr_hz"] + 100.0  # estimates span the glide
+    assert m["confidence"]["F1"] < s["confidence"]["F1"]
+
+
+def test_formant_track_with_contour():
+    """contour=True adds a per-frame F1-F3 track aligned in time."""
+    sr = 16000
+    x = vowel_like(f0_hz=120.0, duration_s=0.6, sr=sr)
+    report = analyze(AudioData(samples=x, sample_rate=sr, path=None), contour=True)
+    ft = report["formant_track"]
+    assert set(ft) == {"times_s", "F1_hz", "F2_hz", "F3_hz"}
+    assert len(ft["times_s"]) == len(ft["F1_hz"]) == len(ft["F2_hz"]) == len(ft["F3_hz"])
+    assert len(ft["times_s"]) <= 200  # payload stays small
+    voiced_f1 = [f for f in ft["F1_hz"] if f is not None]
+    assert len(voiced_f1) > 5
+    assert np.median(voiced_f1) == pytest.approx(730.0, rel=0.15)
+    # unvoiced (or formant-less) frames are None, never stale values
+    assert ft["times_s"] == sorted(ft["times_s"])
 
 
 def test_analyze_computes_f0_once(monkeypatch, tmp_path):

@@ -150,15 +150,50 @@ same file reuse cached analysis results.
 
 Configuration via environment variables:
 
-| Variable              | Default                    |
-|-----------------------|----------------------------|
-| `SPEECHLAB_API_KEY`   | — (required)               |
-| `SPEECHLAB_BASE_URL`  | `https://api.openai.com/v1`|
-| `SPEECHLAB_MODEL`     | `gpt-4o-mini`              |
+| Variable                   | Default                    |
+|----------------------------|----------------------------|
+| `SPEECHLAB_API_KEY`        | — (required)               |
+| `SPEECHLAB_BASE_URL`       | `https://api.openai.com/v1`|
+| `SPEECHLAB_MODEL`          | `gpt-4o-mini`              |
+| `SPEECHLAB_ALLOWED_DIRS`   | current working directory  |
+| `SPEECHLAB_REDACT_PATHS`   | off                        |
 
 The system prompt instructs the agent to always measure before
 interpreting, report units (Hz, dB, ms, %) with normal ranges, and
 distinguish established results from hypotheses.
+
+## Privacy & security boundaries
+
+What you should know before pointing the agent at recordings:
+
+**What leaves the machine.** Audio itself never leaves your machine for
+the acoustic tools — F0/formants/jitter/shimmer/HNR/diarization are all
+computed locally. Two things do travel to the configured LLM endpoint:
+your question (and any attached analysis context), and the JSON tool
+results the model requests. If you use `transcribe_audio` without a
+local whisper installation, the audio file is sent to the configured
+Whisper-compatible API.
+
+**Path sandbox.** The model chooses which files its tools read — and a
+model can be confused or prompt-injected, so file access is confined to
+an allowlist of directories (`AgentConfig.allowed_dirs`, default the
+current working directory; override with `SPEECHLAB_ALLOWED_DIRS`, an
+`os.pathsep`-separated list). Paths are resolved *including symlinks*
+before the check, so `../` traversal and in-workspace symlinks pointing
+outside both fail closed with a `PermissionError` the model sees as a
+tool error. The web UI sandboxes further still: agents there can only
+ever touch the current session's uploaded files.
+
+**Path redaction.** Directory names can carry identifying information
+(`/home/alice/patients/…`, study IDs, usernames). Set
+`SPEECHLAB_REDACT_PATHS=1` (or `AgentConfig(redact_paths=True)`) and
+tool results ship paths as `…/patient_042.wav` — basename only — before
+anything reaches the API. The web UI always redacts server-side upload
+paths this way.
+
+**Clinical caveat.** Reference ranges are literature screening values;
+the agent states them as such and defers clinical decisions to
+certified professionals.
 
 ## Method notes
 
@@ -171,9 +206,12 @@ distinguish established results from hypotheses.
   `α = exp(−2π·f·Δt)` (50 Hz corner), the analysis order is 2 poles per
   formant (5 formants / 10 poles), and only **voiced** frames (energetic
   half) enter the median, so plosive bursts and fricatives cannot pose as
-  formants. DC and Nyquist-adjacent roots are discarded.
-  Validated against known-pole synthetic signals in
-  `tests/test_formant_golden.py`.
+  formants. DC and Nyquist-adjacent roots are discarded. The report also
+  states how much to trust each median: frame count, interquartile spread
+  across frames, and a per-formant `confidence` in [0, 1] (coverage ×
+  stability — a gliding or noisy formant scores low); `contour=True` adds
+  the per-frame F1–F3 track. Validated against known-pole synthetic
+  signals in `tests/test_formant_golden.py`.
 - **Jitter/shimmer**: epoch picking on a low-pass smoothed waveform
   (quarter-period smoothing suppresses formant ripple), local
   period-to-period and amplitude perturbation. Computed on the longest

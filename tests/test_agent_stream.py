@@ -5,6 +5,7 @@ dicts, so no network access is required.
 """
 
 import json
+import os
 import urllib.error
 
 from speechlab.agent import AgentConfig, SpeechResearchAgent
@@ -12,8 +13,11 @@ from speechlab.agent import AgentConfig, SpeechResearchAgent
 from .helpers import vowel_like, write_wav
 
 
-def _mk_agent():
-    return SpeechResearchAgent(AgentConfig(api_key="sk-test", model="fake"))
+def _mk_agent(tmp_path=None):
+    cfg: dict = {"api_key": "sk-test", "model": "fake"}
+    if tmp_path is not None:
+        cfg["allowed_dirs"] = [str(tmp_path)]
+    return SpeechResearchAgent(AgentConfig(**cfg))
 
 
 def test_ask_stream_simple_answer():
@@ -48,7 +52,7 @@ def test_ask_stream_tool_call_round(tmp_path):
         for tok in ["jitter ", "looks normal"]:
             yield {"choices": [{"delta": {"content": tok}}]}
 
-    agent = _mk_agent()
+    agent = _mk_agent(tmp_path)
     agent._stream_chat_request = fake_stream  # type: ignore[method-assign]
     events = list(agent.ask_stream("analyse the file"))
 
@@ -98,22 +102,22 @@ def test_tool_reference_ranges_unknown_metric():
 def test_tool_compare_audio(tmp_path):
     a = write_wav(str(tmp_path / "a.wav"), vowel_like(duration_s=0.6, f0_hz=150), 16000)
     b = write_wav(str(tmp_path / "b.wav"), vowel_like(duration_s=0.6, f0_hz=250), 16000)
-    agent = _mk_agent()
+    agent = _mk_agent(tmp_path)
     out = agent.tools["compare_audio"]({"path_a": a, "path_b": b})
-    assert out["files"] == [a, b]
+    assert [os.path.basename(f) for f in out["files"]] == ["a.wav", "b.wav"]
     assert any(r["metric"] == "f0_median_hz" for r in out["metrics"])
     assert "f0_ttest" in out  # contours were compared inferentially
 
 
 def test_tool_diarize_audio(tmp_path):
     a = write_wav(str(tmp_path / "a.wav"), vowel_like(duration_s=1.0), 16000)
-    agent = _mk_agent()
+    agent = _mk_agent(tmp_path)
     out = agent.tools["diarize_audio"]({"path": a, "n_speakers": 0})
     assert "n_speakers" in out and "turns" in out
 
 
 def test_tool_transcribe_missing_file(tmp_path):
-    agent = _mk_agent()
+    agent = _mk_agent(tmp_path)
     out = json.loads(agent._execute_tool({
         "id": "c1", "type": "function",
         "function": {"name": "transcribe_audio",

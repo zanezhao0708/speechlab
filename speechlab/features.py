@@ -913,8 +913,16 @@ def analyze(audio: AudioData, contour: bool = False,
             formant_ceiling: float = FORMANT_CEILING_HZ) -> dict:
     """Run a standard acoustic analysis and return a JSON-ready dict.
 
-    With ``contour=True`` a downsampled F0 track (``pitch_contour``) is
-    included for plotting.  ``formant_ceiling`` follows Praat's Formant(Burg)
+    ``formants`` carries not just the median F1–F3 but how trustworthy
+    each median is: the number of frames behind it, the interquartile
+    spread across frames (``F*_iqr_hz``) and a per-formant
+    ``confidence`` in [0, 1] combining coverage (how often the formant
+    was found at all) with stability (how little the frame-wise
+    estimates scatter around the median).
+
+    With ``contour=True`` a downsampled F0 track (``pitch_contour``)
+    and per-frame formant track (``formant_track``) are included for
+    plotting.  ``formant_ceiling`` follows Praat's Formant(Burg)
     convention: the signal is resampled to twice the ceiling before LPC.
     """
     sr, x = audio.sample_rate, audio.samples
@@ -941,6 +949,7 @@ def analyze(audio: AudioData, contour: bool = False,
     # Voicing matters: the loudest frames of an utterance are often
     # plosive bursts or fricatives, whose LPC roots are not formants.
     formant_summary: dict = {}
+    formant_rows_by_frame: dict[int, list[float]] = {}
     x_f, sr_f = _resample_for_formants(x, sr, formant_ceiling)
     fl_f, hl_f = default_frame_lengths(sr_f)
     frames_f = frame_signal(x_f, fl_f, hl_f, window="rect", center=True)
@@ -948,19 +957,40 @@ def analyze(audio: AudioData, contour: bool = False,
         voiced_f = track.voiced[: len(frames_f)]
         if np.any(voiced_f):
             energy_f = np.sqrt(np.mean(frames_f ** 2, axis=1) + 1e-12)
-            cand = np.where(voiced_f)[0]
-            # most energetic half of the voiced frames (≥5 when available):
-            # keeps the vowel core, drops glide/nasal tails
-            cand = cand[np.argsort(energy_f[cand])]
-            cand = cand[-max(5, len(cand) // 2):] if len(cand) > 5 else cand
-            formant_rows = [formants(frames_f[i], sr_f) for i in cand]
-            formant_rows = [r for r in formant_rows if len(r) >= 3]
-            if formant_rows:
-                f_stack = np.vstack([r[:3] for r in formant_rows])
+            v_idx = np.where(voiced_f)[0]
+            # one LPC pass per voiced frame feeds both the median summary
+            # and the per-frame track
+            formant_rows_by_frame = {int(i): formants(frames_f[i], sr_f)
+                                     for i in v_idx}
+            # headline medians: most energetic half of the voiced frames
+            # (≥5 when available) — keeps the vowel core, drops glide/
+            # nasal tails
+            sel = v_idx[np.argsort(energy_f[v_idx])]
+            sel = sel[-max(5, len(v_idx) // 2):] if len(v_idx) > 5 else sel
+            rows = [formant_rows_by_frame[int(i)] for i in sel]
+            full_rows = [r for r in rows if len(r) >= 3]
+            if full_rows:
+                f_stack = np.vstack([r[:3] for r in full_rows])
+                med = np.median(f_stack, axis=0)
+                q25, q75 = np.percentile(f_stack, [25, 75], axis=0)
+                iqr = q75 - q25
+                # coverage: how many of the analysed frames yielded this
+                # formant at all (missing LPC roots lower confidence)
+                coverage = [float(np.mean([len(r) > k for r in rows])) for k in range(3)]
+                # stability: relative scatter around the median; a 20 % IQR
+                # (e.g. ±10 % around the median) already scores 0
+                stability = [float(np.clip(1.0 - iqr[k] / (0.2 * max(med[k], 1.0)), 0.0, 1.0))
+                             for k in range(3)]
                 formant_summary = {
-                    "F1_hz": float(np.median(f_stack[:, 0])),
-                    "F2_hz": float(np.median(f_stack[:, 1])),
-                    "F3_hz": float(np.median(f_stack[:, 2])),
+                    "F1_hz": float(med[0]),
+                    "F2_hz": float(med[1]),
+                    "F3_hz": float(med[2]),
+                    "n_frames": len(f_stack),
+                    "F1_iqr_hz": round(float(iqr[0]), 1),
+                    "F2_iqr_hz": round(float(iqr[1]), 1),
+                    "F3_iqr_hz": round(float(iqr[2]), 1),
+                    "confidence": {f"F{k + 1}": round(coverage[k] * stability[k], 2)
+                                   for k in range(3)},
                 }
 
     report = {
@@ -985,6 +1015,23 @@ def analyze(audio: AudioData, contour: bool = False,
             "times_s": [round(float(t), 3) for t in track.times[idx]],
             "f0_hz": [round(float(f), 1) if v else None
                       for f, v in zip(track.f0[idx], track.voiced[idx])],
+        }
+        # per-frame formant track (voiced frames only, None elsewhere),
+        # downsampled to ≤ 200 points like the pitch contour
+        step_f = max(1, len(frames_f) // 200)
+        idx_f = np.arange(0, len(frames_f), step_f)
+        times_f = (np.arange(len(frames_f)) * hl_f + fl_f / 2 - fl_f // 2) / sr_f
+        cols: list[list] = [[], [], []]
+        for i in idx_f:
+            row = formant_rows_by_frame.get(int(i))
+            for k in range(3):
+                cols[k].append(round(row[k], 1)
+                               if row is not None and len(row) > k else None)
+        report["formant_track"] = {
+            "times_s": [round(float(t), 3) for t in times_f[idx_f]],
+            "F1_hz": cols[0],
+            "F2_hz": cols[1],
+            "F3_hz": cols[2],
         }
         report["spectrogram"] = spectrogram(x, sr)
     return report

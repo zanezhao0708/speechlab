@@ -39,7 +39,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 if __package__ in (None, ""):  # executed directly: `python web/app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from speechlab.agent import AgentConfig, SpeechResearchAgent
+from speechlab.agent import AgentConfig, SpeechResearchAgent, redact_path
 from speechlab.asr import transcribe as _asr_transcribe
 from speechlab.audio import load_audio
 from speechlab.features import analyze
@@ -163,11 +163,17 @@ def _resolve_upload(upload_dir: str, raw: str) -> str:
 
 
 def _make_tools(upload_dir: str, api_key: str = "", base_url: str = "") -> dict:
-    """Agent tools restricted to this session's uploaded files."""
+    """Agent tools restricted to this session's uploaded files.
+
+    Paths inside results are reduced to their basename: the server-side
+    upload directory is an implementation detail the LLM API has no
+    business seeing.
+    """
 
     def analyze_audio(args: dict) -> dict:
-        return _cached_analyze(_resolve_upload(upload_dir, args.get("path", "")),
-                               contour=False)
+        report = _cached_analyze(
+            _resolve_upload(upload_dir, args.get("path", "")), contour=False)
+        return dict(report, file=redact_path(str(report.get("file") or "")))
 
     def compare_audio(args: dict) -> dict:
         ra = _cached_analyze(_resolve_upload(upload_dir, args.get("path_a", "")),

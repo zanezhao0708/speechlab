@@ -141,7 +141,11 @@ def agent(question: str, context_path: str | None) -> None:
     if context_path:
         context = {"audio_analysis": analyze(load_audio(context_path))}
     try:
-        ag = SpeechResearchAgent(AgentConfig())
+        cfg = AgentConfig()
+        if context_path:  # let follow-up tool calls reach the context file
+            cfg.allowed_dirs = [os.path.dirname(os.path.abspath(context_path)),
+                                *cfg.allowed_dirs]
+        ag = SpeechResearchAgent(cfg)
         answer = ag.ask(question, context=context)
     except RuntimeError as exc:
         raise click.ClickException(str(exc))
