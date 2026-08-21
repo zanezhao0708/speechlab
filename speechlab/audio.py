@@ -175,6 +175,7 @@ def frame_signal(
     window: str = "hann",
     center: bool = True,
     pad_mode: str = "constant",
+    dtype: np.dtype | type | None = None,
 ) -> np.ndarray:
     """Slice a signal into overlapping frames.
 
@@ -188,16 +189,21 @@ def frame_signal(
     ``reflect`` padding mirrors the signal at the boundary, and the mirror
     symmetry of a periodic signal produces a spurious autocorrelation peak at
     twice the period (an octave-down error) in the edge frames.
+
+    ``dtype`` selects the framing precision (default float64).  float32
+    halves the memory traffic of the windowing and the downstream FFTs and
+    is appropriate for dB-scale summary measures whose reporting resolution
+    is far above single-precision error.
     """
     from numpy.lib.stride_tricks import sliding_window_view
 
-    x = np.asarray(samples, dtype=np.float64)
+    x = np.asarray(samples, dtype=np.float64 if dtype is None else dtype)
     if center:  # pad so that frames are centred on sample indices
         pad = frame_length // 2
         x = np.pad(x, (pad, pad), mode=pad_mode)
 
     if len(x) < frame_length:
-        return np.empty((0, frame_length), dtype=np.float64)
+        return np.empty((0, frame_length), dtype=x.dtype)
 
     frames = sliding_window_view(x, frame_length)[::hop_length]
 
@@ -210,4 +216,4 @@ def frame_signal(
         w = np.hamming(frame_length)
     else:
         raise ValueError(f"unknown window: {window}")
-    return frames * w
+    return frames * w.astype(x.dtype, copy=False)

@@ -60,6 +60,17 @@ def default_frame_lengths(sr: int) -> tuple[int, int]:
     return max(1, round(sr * 0.025)), max(1, round(sr * 0.010))
 
 
+def _frame_rms(frames: np.ndarray) -> np.ndarray:
+    """Per-frame RMS without materialising the squared-frames temporary.
+
+    ``np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)`` allocates a full
+    (n_frames, frame_length) temporary for the squares; the einsum
+    sum-of-products accumulates directly, which is markedly faster on long
+    recordings.
+    """
+    return np.sqrt(np.einsum("ij,ij->i", frames, frames) / frames.shape[1] + 1e-12)
+
+
 def _json_ready(obj: Any) -> Any:
     """Replace non-finite floats (NaN/±inf) with ``None`` recursively.
 
@@ -184,7 +195,7 @@ def f0_track(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500
         return F0Track(times=times, f0=f0, voiced=voiced)
 
     # energy gate
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms = _frame_rms(frames)
     rms_db = db(rms ** 2)
     active = rms_db > energy_floor_db
 
@@ -583,10 +594,14 @@ def cpps(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
     if q_min >= q_max:
         raise ValueError("pitch search range does not fit the analysis frame")
 
-    frames = frame_signal(x, frame_length, hop_length, window="hann", center=True)
+    # float32 framing: the measure is a dB-scale average reported to 0.01 dB,
+    # three orders of magnitude above single-precision error, and single
+    # precision halves the FFT time and memory traffic
+    frames = frame_signal(x, frame_length, hop_length, window="hann",
+                          center=True, dtype=np.float32)
     if len(frames) == 0:
         return float("nan")
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms = _frame_rms(frames)
     active = db(rms ** 2) > energy_floor_db
     if not np.any(active):
         return float("nan")
@@ -602,12 +617,13 @@ def cpps(samples: np.ndarray, sr: int, fmin: float = 60.0, fmax: float = 500.0,
     spec *= 20.0
     cep = irfft(spec, n=frame_length, axis=1, workers=-1)
 
-    # per-frame linear trend over quefrency 0..q_max
-    q = np.arange(q_max + 1, dtype=np.float64)
+    # per-frame linear trend over quefrency 0..q_max; sum(qc) is exactly 0,
+    # so (c - c_mean) @ qc == c @ qc and the centred temporary is avoided
+    q = np.arange(q_max + 1, dtype=np.float32)
     qc = q - q.mean()
     c = cep[:, : q_max + 1]
     c_mean = c.mean(axis=1)
-    slope = ((c - c_mean[:, None]) @ qc) / np.dot(qc, qc)
+    slope = (c @ qc) / np.dot(qc, qc)
     intercept = c_mean - slope * q.mean()
 
     # prominence of the cepstral peak in the pitch quefrency band
@@ -643,16 +659,19 @@ def spectral_stats(samples: np.ndarray, sr: int,
     from scipy.fft import rfft, rfftfreq
 
     frame_length, hop_length = _defaults(sr, frame_length, hop_length)
-    frames = frame_signal(samples, frame_length, hop_length, window="hann", center=True)
+    # float32 FFT stage (see cpps): the LTAS reductions are promoted to
+    # float64 afterwards, well inside the reporting resolution
+    frames = frame_signal(samples, frame_length, hop_length, window="hann",
+                          center=True, dtype=np.float32)
     if len(frames) == 0:
         return {}
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms = _frame_rms(frames)
     active = db(rms ** 2) > energy_floor_db
     if not np.any(active):
         return {}
 
     spec = np.abs(rfft(frames[active], axis=1, workers=-1))
-    power = spec.mean(axis=0) ** 2
+    power = spec.mean(axis=0).astype(np.float64) ** 2
     freqs = rfftfreq(frame_length, 1.0 / sr)
 
     total = float(np.sum(power))
@@ -702,7 +721,7 @@ def vad_segments(samples: np.ndarray, sr: int,
     if len(frames) == 0 or duration <= 0:
         return []
 
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms = _frame_rms(frames)
     active = db(rms ** 2) > energy_floor_db
     idx = np.where(active)[0]
     if len(idx) == 0:
@@ -820,7 +839,7 @@ def analyze(audio: AudioData) -> dict:
     track = f0_track(x, sr, frames=frames)
     js = jitter_shimmer(x, sr, track=track)
     # median formants over the most energetic voiced frames
-    energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12) if len(frames) else np.empty(0)
+    energy = _frame_rms(frames) if len(frames) else np.empty(0)
     top = np.argsort(energy)[-max(5, len(energy) // 10):] if len(energy) else []
     formant_rows = _batch_formants(frames[top], sr)
     formant_rows = [r for r in formant_rows if len(r) >= 3]
