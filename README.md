@@ -274,20 +274,58 @@ Outputs: `results.csv` (per file), `summary.json` / `summary.md`
 (headline table), `scatter.png` and `bland_altman.png` when matplotlib is
 installed.
 
-> Status: the harness is validated on synthetic data; the real-speech
-> numbers (100+ files across clean/noisy/pathological conditions) are the
-> next step and will be reported here. Until then treat SpeechLab's
-> formant and perturbation values as screening-grade, and cross-check
-> publication-grade numbers against Praat / VoiceSauce.
->
-> Current synthetic-set agreement (24 source-filter vowels across
+### Real-speech results (CMU Arctic, 100 files)
+
+Corpus: 100 utterances from four CMU Arctic speakers (bdl, rms = male;
+slt, clb = female) — 80 clean 16 kHz originals, 10 resampled to
+44.1/22.05 kHz, 10 noise-added at 0–20 dB SNR — plus a 10-file 8 kHz
+telephony subset analysed at a 3800 Hz formant ceiling. Download and
+condition derivation are scripted (`benchmarks/download_cmu_arctic.py`,
+`benchmarks/derive_conditions.py`), and the full per-file CSV, scatter
+and Bland-Altman figures are committed under `bench_results/`.
+
+| Metric | n | MAE / bias (SL−Praat) | LoA 95% | Pearson r |
+|---|---|---|---|---|
+| F0 frame-wise | 20467 frames | 1.92 Hz (median 1.18) / 22.5 cents | — | — |
+| F0 median per file | 100 | +1.06 Hz | ±3.3 Hz | 0.999 |
+| F1 | 100 | 21.1 / +14.4 Hz | [−40, +69] Hz | 0.977 |
+| F2 | 100 | 64.3 / +43.0 Hz | [−106, +192] Hz | 0.950 |
+| F3 | 100 | 69.1 / +43.1 Hz | [−162, +248] Hz | 0.942 |
+| jitter (local) | 100 | +0.39 pp | [−1.7, +2.4] pp | 0.37* |
+| shimmer (local dB) | 100 | +0.11 dB | [−0.24, +0.47] dB | 0.69 |
+| HNR | 100 | −2.66 dB | [−6.3, +1.0] dB | 0.93 |
+
+\* Pearson r on jitter is depressed by range restriction: the corpus is
+all-normal voices, so Praat's jitter spans only 0.6–4.4 % (IQR 0.9 pp)
+while the disagreement sd is ~1.0 pp — the noise-to-signal ratio alone
+caps r near 0.6. The agreement statistics (bias, LoA) are the meaningful
+ones here. The 8 kHz telephony subset, whose jitter values spread wider,
+gives r = 0.755 (bias +0.16 pp).
+
+Agreement holds across conditions: per-file F0 r ≥ 0.999 and jitter
+bias within ±1 pp in *every* group (clean / resampled / 0–20 dB SNR /
+8 kHz telephony); F2/F3 show a systematic +40–100 Hz offset that grows
+at non-native sample rates — LPC-pole vs Burg-pole disagreement, not a
+selection artifact. HNR carries a stable −2.7 dB calibration offset
+(autocorrelation-vs-cc definition).
+
+This run also caught and fixed a real bug: without Praat's
+stability-factor pair exclusion (maxPeriodFactor 1.3 / maxPeakFactor
+1.6) the native jitter averaged epoch-walk glitches on connected speech
+and reported a median 44 % where Praat reported 1.8 %.
+
+> Synthetic-set agreement (24 source-filter vowels across
 > clean/noisy/jittered/shimmered/8 kHz conditions): per-file median F0
 > r = 1.000 (bias −0.17 Hz, LoA ±1.5 Hz, zero octave errors), F1 MAE
 > 20 Hz (r = 0.92), F2 90 Hz (r = 0.91), F3 74 Hz (r = 0.97), HNR
 > r = 0.98 (bias −1.8 dB). Jitter r = 0.88 (bias +0.6 %), shimmer
-> r = 0.89 (bias +0.2 dB) — the epoch-based estimators track Praat's
-> point-process definitions closely on synthetic vowels but remain
-> triage-grade until real-speech validation lands.
+> r = 0.89 (bias +0.2 dB).
+>
+> Remaining gap to publication-grade evidence: sustained vowels and
+> rough/pathological voices (the Saarbrücken Voice Database requires a
+> licence agreement), and corpus sizes beyond 100 files. Until then
+> cross-check publication-critical perturbation numbers with
+> `backend="praat"`.
 
 ## Praat backend (publication-grade)
 

@@ -16,5 +16,7 @@ htmlcov/
 *.mp3
 !tests/data/**
 web/data/
-bench_results/
+bench_results/*
+!bench_results/cmu_arctic_100/
+!bench_results/cmu_arctic_100_telephony/
 .trae-html-share-packages/
