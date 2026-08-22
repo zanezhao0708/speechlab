@@ -54,6 +54,8 @@ MAX_SESSIONS = 64
 SESSION_UPLOAD_QUOTA = 200 * 1024 * 1024   # total bytes per session
 CHAT_RATE_LIMIT = (8, 60.0)                # max 8 chat calls per 60 s
 CHAT_CONCURRENCY = 4                       # simultaneous LLM calls server-wide
+ANALYZE_RATE_LIMIT = (30, 60.0)            # direct analyses per 60 s, server-wide
+ANALYZE_CONCURRENCY = 2                    # simultaneous CPU-bound analyses
 
 #: shared-password gate: empty → auth disabled
 WEB_PASSWORD = os.environ.get("SPEECHLAB_WEB_PASSWORD", "")
@@ -85,6 +87,12 @@ class Session:
 _SESSIONS: dict[str, Session] = {}
 _LOCK = threading.Lock()
 _CHAT_SEMAPHORE = threading.BoundedSemaphore(CHAT_CONCURRENCY)
+
+# /api/analyze is CPU-bound (full contour analysis of up to 50 MB) and needs
+# no session or API key, so it is the obvious DoS vector — rate-limit and
+# cap its concurrency like the chat endpoints.
+_ANALYZE_TIMES: deque = deque()
+_ANALYZE_SEMAPHORE = threading.BoundedSemaphore(ANALYZE_CONCURRENCY)
 
 # LRU cache of finished analyses keyed by (size, mtime_ns) so re-analysing
 # the same file (chat tool call after a direct report, repeated questions)
@@ -435,11 +443,20 @@ def analyze_direct():
         return jsonify(error=f"不支持的格式 {ext or '(无扩展名)'}，请上传 wav/mp3/flac/ogg"), 400
     tmpdir = tempfile.mkdtemp(prefix="speechlab-direct-")
     try:
+        now = time.time()
+        with _LOCK:
+            max_calls, window_s = ANALYZE_RATE_LIMIT
+            while _ANALYZE_TIMES and now - _ANALYZE_TIMES[0] > window_s:
+                _ANALYZE_TIMES.popleft()
+            if len(_ANALYZE_TIMES) >= max_calls:
+                return jsonify(error="分析请求太频繁，请稍后再试"), 429
+            _ANALYZE_TIMES.append(now)
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(f.filename))
         path = os.path.join(tmpdir, safe)
         f.save(path)
         try:
-            report = _cached_analyze(path, contour=True)
+            with _ANALYZE_SEMAPHORE:
+                report = _cached_analyze(path, contour=True)
         except Exception as exc:  # noqa: BLE001 — report file/decoding problems
             return jsonify(error=f"分析失败：{exc}"), 400
     finally:
@@ -502,10 +519,32 @@ def trends():
         return jsonify(ok=True)
     body = request.get_json(force=True)
     row = body if isinstance(body, dict) else {}
+
+    def _num(v):
+        """Coerce to float-or-None; rejects bools and non-numeric strings."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise TypeError(f"{v!r} is not a number")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{v!r} is not a number")
+
+    try:
+        f0, jitter, shimmer, hnr = (
+            _num(row.get(k)) for k in ("f0", "jitter", "shimmer", "hnr"))
+        ts = _num(row.get("ts"))
+    except (TypeError, ValueError) as exc:
+        return jsonify(error=f"无效的测量数据：{exc}"), 400
+    if ts is None:
+        ts = time.time()
+    elif not 0.0 < ts <= time.time() + 300.0:
+        # reject forged far-past / far-future rows that would distort trends
+        return jsonify(error="无效的时间戳"), 400
     STORE.add_measurement(
         user_key, str(row.get("file", ""))[:200],
-        row.get("f0"), row.get("jitter"), row.get("shimmer"), row.get("hnr"),
-        ts=row.get("ts"))
+        f0, jitter, shimmer, hnr, ts=ts)
     return jsonify(ok=True)
 
 

@@ -14,7 +14,18 @@ from web.app import _ANALYSIS_CACHE, app
 
 
 @pytest.fixture()
-def client():
+def client(tmp_path, monkeypatch):
+    """Test client with an isolated per-test database.
+
+    Without this swap the routes would write into the module-level Store
+    (``web/data/speechlab.db``), leaking rows between test runs and
+    polluting any real deployment the tests happen to run against.
+    """
+    from web import app as webapp_mod
+    from web.store import Store
+    monkeypatch.setattr(webapp_mod, "STORE", Store(str(tmp_path / "test.db")))
+    webapp_mod._ANALYZE_TIMES.clear()
+    _ANALYSIS_CACHE.clear()
     app.config["TESTING"] = True
     with app.test_client() as c:
         yield c
@@ -136,3 +147,42 @@ def test_reset(client):
     r2 = client.post("/api/reset", json={"session_id": sid})
     assert r2.status_code == 200
     assert r2.get_json()["ok"] is True
+
+
+def test_analyze_rate_limit(client, monkeypatch):
+    """/api/analyze is CPU-bound and keyless — it must be rate limited."""
+    from web import app as webapp_mod
+    monkeypatch.setattr(webapp_mod, "ANALYZE_RATE_LIMIT", (2, 60.0))
+    webapp_mod._ANALYZE_TIMES.clear()
+    try:
+        codes = [
+            client.post("/api/analyze", data={
+                "file": (io.BytesIO(_wav_bytes()), "a.wav"),
+            }, content_type="multipart/form-data").status_code
+            for _ in range(3)
+        ]
+        assert codes[:2] == [200, 200]
+        assert codes[2] == 429
+    finally:
+        webapp_mod._ANALYZE_TIMES.clear()
+
+
+def test_trends_rejects_bad_payloads(client):
+    headers = {"X-User-Key": "tester"}
+    # non-numeric metric
+    r = client.post("/api/trends", json={"f0": "abc"}, headers=headers)
+    assert r.status_code == 400
+    # boolean masquerading as a number
+    r = client.post("/api/trends", json={"f0": True}, headers=headers)
+    assert r.status_code == 400
+    # forged far-future timestamp
+    r = client.post("/api/trends",
+                    json={"f0": 120.0, "ts": 9999999999.0}, headers=headers)
+    assert r.status_code == 400
+    # valid row round-trips
+    r = client.post("/api/trends",
+                    json={"f0": 120.5, "jitter": 0.4, "file": "a.wav"},
+                    headers=headers)
+    assert r.status_code == 200
+    rows = client.get("/api/trends", headers=headers).get_json()["measurements"]
+    assert len(rows) == 1 and rows[0]["f0"] == 120.5

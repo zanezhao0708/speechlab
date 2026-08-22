@@ -15,12 +15,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import uuid
 from typing import Any
 
 __all__ = ["transcribe"]
+
+#: module-level cache for loaded local models — loading whisper's "base"
+#: takes seconds and would otherwise happen on every transcription call
+_MODEL_CACHE: dict[str, Any] = {}
 
 
 def _local_whisper(path: str, language: str | None) -> dict | None:
@@ -31,8 +36,10 @@ def _local_whisper(path: str, language: str | None) -> dict | None:
         whisper = None
 
     if whisper is not None:
-        model = whisper.load_model("base")
-        result = model.transcribe(path, language=language or None)
+        if "openai-whisper" not in _MODEL_CACHE:
+            _MODEL_CACHE["openai-whisper"] = whisper.load_model("base")
+        result = _MODEL_CACHE["openai-whisper"].transcribe(
+            path, language=language or None)
         return {
             "text": str(result.get("text", "")).strip(),
             "language": result.get("language"),
@@ -44,14 +51,29 @@ def _local_whisper(path: str, language: str | None) -> dict | None:
     except ImportError:
         return None
 
-    model = WhisperModel("base", compute_type="int8")
-    segments, info = model.transcribe(path, language=language or None)
+    if "faster-whisper" not in _MODEL_CACHE:
+        _MODEL_CACHE["faster-whisper"] = WhisperModel("base", compute_type="int8")
+    segments, info = _MODEL_CACHE["faster-whisper"].transcribe(
+        path, language=language or None)
     text = " ".join(s.text.strip() for s in segments).strip()
     return {
         "text": text,
         "language": getattr(info, "language", None),
         "engine": "local faster-whisper (base, int8)",
     }
+
+
+def _sanitize_filename(name: str) -> str:
+    r"""Make a filename safe to embed in a multipart Content-Disposition header.
+
+    ``os.path.basename`` strips path separators but not quotes or CR/LF —
+    a crafted name (reachable via the agent's ``transcribe_audio`` tool
+    arguments) would inject arbitrary bytes into the HTTP headers.
+    """
+    name = os.path.basename(name)
+    name = re.sub(r'[\r\n"\\]', "_", name)
+    name = name.strip() or "audio"
+    return name[:80]
 
 
 def _multipart(fields: dict[str, str], file_path: str) -> tuple[bytes, str]:
@@ -63,7 +85,7 @@ def _multipart(fields: dict[str, str], file_path: str) -> tuple[bytes, str]:
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n"
             f"\r\n{value}\r\n".encode()
         )
-    fname = os.path.basename(file_path)
+    fname = _sanitize_filename(file_path)
     with open(file_path, "rb") as fh:
         blob = fh.read()
     parts.append(
@@ -113,7 +135,15 @@ def transcribe(path: str, language: str | None = None,
         raise FileNotFoundError(path)
 
     local = _local_whisper(path, language)
-    if local is not None and local["text"]:
+    if local is not None:
+        # A local backend ran: its answer is final.  Empty text is a
+        # legitimate result (e.g. a silent recording) — falling through to
+        # the remote API here would upload the audio to a third party the
+        # user may have deliberately avoided by installing local whisper,
+        # and would raise a confusing "no API key" error even though the
+        # offline path succeeded.
+        if not local["text"]:
+            local = dict(local, note="no speech detected by the local model")
         return local
 
     api_key = api_key or os.environ.get("SPEECHLAB_API_KEY", "")
