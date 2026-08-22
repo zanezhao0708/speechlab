@@ -13,21 +13,26 @@ Methodological note
 -------------------
 Jitter/shimmer/HNR are computed on the longest voiced segment (Praat's own
 docs define these as sustained-vowel measures), matching the native
-backend's semantics exactly.  Signal-level utilities that Praat does not
-define (recording quality, pause statistics, spectrogram) are reused from
-the native implementation so both backends return an identical schema.
+backend's semantics exactly.  Formant headline medians use the shared
+:func:`speechlab.features.select_formant_frames` rule (most energetic half
+of the voiced frames), so cross-backend formant differences isolate the
+LPC engine.  Signal-level utilities that Praat does not define (recording
+quality, pause statistics, spectrogram) are reused from the native
+implementation so both backends return an identical schema.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .audio import AudioData
+from .audio import AudioData, frame_signal
 from .features import (
     FORMANT_CEILING_HZ,
     F0Track,
+    default_frame_lengths,
     pause_stats,
     recording_quality,
+    select_formant_frames,
     spectrogram,
     voiced_segments,
 )
@@ -71,8 +76,9 @@ def analyze_praat(audio: AudioData, contour: bool = False,
 
     Returns the same keys as the native report, with ``backend`` set to the
     parselmouth version string.  Formant medians/IQR/confidence follow the
-    native computation over Praat's frame-wise Formant values on voiced
-    frames, so downstream consumers (agent, web UI, CSV export) need no
+    native selection rule — the most energetic half of the voiced frames,
+    via :func:`select_formant_frames` — over Praat's frame-wise Formant
+    values, so downstream consumers (agent, web UI, CSV export) need no
     changes beyond reading ``report["backend"]``.
     """
     parselmouth = _require()
@@ -115,7 +121,10 @@ def analyze_praat(audio: AudioData, contour: bool = False,
     hv = hv[hv > -200]  # Praat's "undefined" sentinel
     hnr_db = float(np.mean(hv)) if len(hv) else float("nan")
 
-    # ---- formants: median F1-F3 (+ IQR, confidence) on voiced frames ----
+    # ---- formants: median F1-F3 (+ IQR, confidence) on the same
+    # energetic-half-of-voiced-frames rule the native backend uses, so a
+    # native-vs-Praat formant difference is an LPC-engine difference, not
+    # a frame-selection difference -------------------------------
     formant = snd.to_formant_burg(
         time_step=0.01, max_number_of_formants=5,
         maximum_formant=formant_ceiling, window_length=0.025,
@@ -131,7 +140,24 @@ def analyze_praat(audio: AudioData, contour: bool = False,
             else:
                 break  # Praat numbers formants consecutively
         track_rows[i] = row
-        if track.voiced[i] and len(row) == 3:
+    x, sr = audio.samples, audio.sample_rate
+    frame_energies = np.zeros(len(track.times))
+    if len(track.times):
+        fl, hl = default_frame_lengths(sr)
+        frames = frame_signal(np.asarray(x, dtype=np.float64),
+                              fl, hl, window="rect", center=True)
+        if len(frames):
+            energies = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+            hop_s = hl / sr
+            idx_map = np.clip(
+                np.round(np.asarray(track.times) / hop_s).astype(int),
+                0, len(energies) - 1)
+            frame_energies = energies[idx_map]
+    sel = select_formant_frames(frame_energies, track.voiced)
+    sel_set = {int(i) for i in sel}
+    for i in sorted(sel_set):
+        row = track_rows.get(int(i), [])
+        if len(row) == 3:
             f_stack_rows.append(row)
     formant_summary: dict = {}
     if f_stack_rows:
@@ -154,7 +180,6 @@ def analyze_praat(audio: AudioData, contour: bool = False,
                            for k in range(3)},
         }
 
-    x, sr = audio.samples, audio.sample_rate
     report = {
         "file": audio.path,
         "duration_s": round(audio.duration, 3),

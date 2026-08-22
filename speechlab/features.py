@@ -39,6 +39,7 @@ __all__ = [
     "pause_stats",
     "recording_quality",
     "reference_ranges",
+    "select_formant_frames",
     "spectrogram",
     "voiced_segments",
 ]
@@ -1086,6 +1087,25 @@ def _resample_for_formants(x: np.ndarray, sr: int,
     return resample_poly(x, up, down), sr * up // down
 
 
+def select_formant_frames(energies: np.ndarray,
+                          voiced_mask: np.ndarray) -> np.ndarray:
+    """Indices of voiced frames whose formants feed the headline medians.
+
+    The most energetic half of the voiced frames (at least 5 when
+    available): keeps the vowel core, drops glide/nasal tails.  Shared by
+    both measurement backends so that a native-vs-Praat difference in the
+    F1–F3 summary reflects the LPC engine, not a frame-selection policy
+    divergence.
+    """
+    v_idx = np.where(voiced_mask)[0]
+    if len(v_idx) == 0:
+        return v_idx
+    order = v_idx[np.argsort(energies[v_idx])]
+    if len(v_idx) > 5:
+        order = order[-max(5, len(v_idx) // 2):]
+    return order
+
+
 def analyze(audio: AudioData, contour: bool = False,
             formant_ceiling: float = FORMANT_CEILING_HZ,
             backend: str = "native") -> dict:
@@ -1159,8 +1179,7 @@ def analyze(audio: AudioData, contour: bool = False,
             # headline medians: most energetic half of the voiced frames
             # (≥5 when available) — keeps the vowel core, drops glide/
             # nasal tails
-            sel = v_idx[np.argsort(energy_f[v_idx])]
-            sel = sel[-max(5, len(v_idx) // 2):] if len(v_idx) > 5 else sel
+            sel = select_formant_frames(energy_f, voiced_f)
             rows = [formant_rows_by_frame[int(i)] for i in sel]
             full_rows = [r for r in rows if len(r) >= 3]
             if full_rows:

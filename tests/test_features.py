@@ -11,6 +11,7 @@ from speechlab.features import (
     formants,
     hnr,
     jitter_shimmer,
+    select_formant_frames,
 )
 
 from .helpers import noise, perturbed_vowel, tone, vowel_like, write_wav
@@ -232,6 +233,36 @@ def test_formant_confidence_drops_when_estimate_scatters():
     m = analyze(AudioData(samples=moving, sample_rate=sr, path=None))["formants"]
     assert m["F1_iqr_hz"] > s["F1_iqr_hz"] + 100.0  # estimates span the glide
     assert m["confidence"]["F1"] < s["confidence"]["F1"]
+
+
+def test_select_formant_frames_picks_energetic_half():
+    """The shared selection rule: most energetic half of voiced, min 5."""
+    # 20 voiced frames with energies 0..19: the top half (10..19) wins
+    energies = np.arange(20, dtype=float)
+    voiced = np.ones(20, dtype=bool)
+    sel = select_formant_frames(energies, voiced)
+    assert set(sel) == set(range(10, 20))
+
+
+def test_select_formant_frames_keeps_small_sets():
+    # <= 5 voiced frames: keep them all, no halving
+    sel = select_formant_frames(np.array([1.0, 3.0, 2.0, 5.0, 4.0]),
+                                np.ones(5, dtype=bool))
+    assert set(sel) == set(range(5))
+    # 7 voiced frames: half would be 3, but the minimum of 5 applies
+    sel = select_formant_frames(np.arange(7, dtype=float),
+                                np.ones(7, dtype=bool))
+    assert set(sel) == set(range(2, 7))  # the 5 most energetic
+
+
+def test_select_formant_frames_respects_voicing():
+    # unvoiced frames must never be selected, however energetic
+    energies = np.array([9.0, 8.0, 0.1, 7.0, 6.0, 0.2])
+    voiced = np.array([True, False, True, True, False, True])
+    sel = select_formant_frames(energies, voiced)
+    assert set(sel) == {0, 2, 3, 5}  # all 4 voiced frames (<= 5)
+    # all-unvoiced signal: nothing to summarise
+    assert len(select_formant_frames(energies, np.zeros(6, dtype=bool))) == 0
 
 
 def test_formant_track_with_contour():

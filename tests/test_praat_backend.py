@@ -79,6 +79,30 @@ def test_voice_quality_uses_longest_voiced_segment(tmp_path):
     assert end - start >= 0.5
 
 
+def test_formants_use_energetic_half_like_native(tmp_path):
+    """Both backends must share one formant-selection policy.
+
+    A quiet F1=500-Hz half followed by a loud F1=800-Hz half: the headline
+    F1 must track the loud half on *both* backends.  If either backend
+    summed over all voiced frames instead, its F1 would land near the
+    500/800 boundary (~650 Hz) and a native-vs-Praat comparison would mix
+    a selection difference into the engine difference.
+    """
+    sr = 16000
+    quiet = 0.3 * vowel_like(f0_hz=120.0, duration_s=0.5, sr=sr,
+                             formants=((500.0, 1.0), (1500.0, 0.6),
+                                       (2440.0, 0.3)))
+    loud = 0.9 * vowel_like(f0_hz=120.0, duration_s=0.5, sr=sr,
+                            formants=((800.0, 1.0), (1500.0, 0.6),
+                                      (2440.0, 0.3)))
+    path = str(write_wav(str(tmp_path / "two_vowels.wav"),
+                         np.concatenate([quiet, loud]), sr))
+    for backend in ("native", "praat"):
+        f1 = analyze(load_audio(path), backend=backend)["formants"]["F1_hz"]
+        assert 650.0 < f1 < 900.0, (
+            f"{backend} F1={f1:.0f} Hz ignored the energetic half")
+
+
 def test_contour_payload_present(vowel_file):
     rep = analyze(load_audio(vowel_file), backend="praat", contour=True)
     assert len(rep["pitch_contour"]["f0_hz"]) > 10

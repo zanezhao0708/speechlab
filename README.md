@@ -254,6 +254,14 @@ SpeechLab's shipped `analyze()` pipeline and Praat (via the official
 - **Jitter / shimmer / HNR** — Pearson r, bias and Bland-Altman limits of
   agreement across files.
 
+Both sides go through `analyze()` — `backend="native"` vs
+`backend="praat"` — so they share one selection policy (voiced-frame
+filtering, energetic-half formant medians, longest-voiced-segment rule for
+jitter/shimmer/HNR). File-level comparisons therefore isolate the
+measurement engine rather than mixing in selection differences; the only
+exception is the frame-wise F0 metric, which compares the two raw pitch
+trackers directly.
+
 ```bash
 pip install -e ".[bench]"                     # parselmouth + matplotlib
 # self-check of the harness itself (no real data needed):

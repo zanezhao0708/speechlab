@@ -11,16 +11,19 @@ Compares SpeechLab's acoustic analysis against Praat (via the official
   limits of agreement across files.
 
 SpeechLab side
-    Uses exactly the pipeline the agent/web UI ships: ``analyze()``
-    (median formants over energetic frames, jitter/shimmer on the longest
-    voiced segment, autocorrelation HNR) plus ``f0_track()`` for the
-    frame-wise pitch comparison.
+    ``analyze(audio, backend="native")`` — exactly the pipeline the
+    agent/web UI ships.
 
 Praat side
-    ``to_pitch_ac`` (autocorrelation, matching SpeechLab's NCCF family),
-    ``to_formant_burg`` (Burg LPC, the Praat default), local jitter/shimmer
-    via a PointProcess derived from the same pitch object, and
-    ``To Harmonicity (cc)`` for HNR.
+    ``analyze(audio, backend="praat")`` — Praat's engines (``to_pitch_ac``,
+    ``to_formant_burg``, PointProcess-derived jitter/shimmer, harmonicity)
+    wrapped in the *same* report pipeline, so both sides share one
+    selection policy: voiced-frame filtering, energetic-half formant
+    medians and the longest-voiced-segment rule for jitter/shimmer/HNR.
+    File-level comparisons therefore isolate the measurement engine.
+    The one exception is the frame-wise F0 metric, which compares the two
+    raw pitch trackers (nearest-frame alignment) — an engine-level
+    comparison by construction.
 
 Usage
 -----
@@ -68,50 +71,18 @@ AUDIO_EXT = {".wav", ".wave", ".flac", ".mp3", ".ogg"}
 # Praat reference measurements
 # ---------------------------------------------------------------------------
 
-def praat_reference(path: str, fmin: float, fmax: float,
-                    formant_max: float) -> dict:
-    """Praat's own numbers for one file (parselmouth bindings)."""
+def praat_f0_reference(path: str, fmin: float, fmax: float) -> dict:
+    """Praat's raw pitch track for the frame-wise F0 comparison.
+
+    Only the frame grid and F0 values are returned: this feeds the
+    *engine-level* comparison (two trackers' per-frame output on the same
+    signal).  All file-level summary metrics come from
+    ``analyze(backend=...)`` so both sides share one selection policy.
+    """
     snd = parselmouth.Sound(path)
-
     pitch = snd.to_pitch_ac(time_step=0.01, pitch_floor=fmin, pitch_ceiling=fmax)
-    p_times = pitch.xs()
-    p_f0 = pitch.selected_array["frequency"]  # 0 = unvoiced
-
-    formant = snd.to_formant_burg(
-        time_step=0.01, max_number_of_formants=5,
-        maximum_formant=formant_max, window_length=0.025,
-        pre_emphasis_from=50.0)
-    f_vals = {1: [], 2: [], 3: []}
-    for t in p_times[p_f0 > 0]:  # formants only on voiced frames
-        for n in (1, 2, 3):
-            v = formant.get_value_at_time(n, t)
-            if not math.isnan(v) and v > 0:
-                f_vals[n].append(v)
-
-    # PointProcess built from the Sound (not from the Pitch): the Praat
-    # manual warns that Pitch -> To PointProcess leaves pulses unaligned
-    # with the waveform periods, which corrupts shimmer's amplitude
-    # windows.  Shimmer/jitter use Praat's own commands.
-    pp = parselmouth.praat.call(snd, "To PointProcess (periodic, cc)",
-                                fmin, fmax)
-    jitter = parselmouth.praat.call(
-        pp, "Get jitter (local)", 0.0, 0.0, 0.0001, 0.02, 1.3) * 100.0
-    shimmer = parselmouth.praat.call(
-        [snd, pp], "Get shimmer (local_dB)", 0.0, 0.0, 0.0001, 0.02, 1.3, 1.6)
-    harm = parselmouth.praat.call(snd, "To Harmonicity (cc)", 0.01, fmin, 0.1, 1.0)
-    hv = np.asarray(harm.values).ravel()
-    hv = hv[hv > -200]  # Praat's "undefined" sentinel
-    hnr = float(np.mean(hv)) if len(hv) else float("nan")
-
-    voiced = p_f0[p_f0 > 0]
-    return {
-        "times": p_times, "f0": p_f0,
-        "f0_median": float(np.median(voiced)) if len(voiced) else float("nan"),
-        "f1": float(np.median(f_vals[1])) if f_vals[1] else float("nan"),
-        "f2": float(np.median(f_vals[2])) if f_vals[2] else float("nan"),
-        "f3": float(np.median(f_vals[3])) if f_vals[3] else float("nan"),
-        "jitter": float(jitter), "shimmer": float(shimmer), "hnr": hnr,
-    }
+    return {"times": pitch.xs(),
+            "f0": pitch.selected_array["frequency"]}  # 0 = unvoiced
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +92,20 @@ def praat_reference(path: str, fmin: float, fmax: float,
 def speechlab_measure(path: str) -> tuple[dict, dict]:
     """(per-file metrics, f0 track) using the same code the agent uses."""
     audio = load_audio(path)
-    report = analyze(audio)
+    report = analyze(audio, backend="native")
     track = f0_track(audio.samples, audio.sample_rate)
     return report, track
+
+
+def praat_backend_measure(path: str, formant_ceiling: float) -> dict:
+    """Praat report through the same ``analyze()`` pipeline.
+
+    Same report schema *and* the same frame-selection policy as the native
+    side, so every file-level comparison below isolates the measurement
+    engine rather than mixing in selection differences.
+    """
+    return analyze(load_audio(path), backend="praat",
+                   formant_ceiling=formant_ceiling)
 
 
 def compare_f0(sl_track, praat: dict, max_align_s: float = 0.005) -> dict:
@@ -427,31 +409,37 @@ def run(files: list[str], out_dir: str, fmin: float, fmax: float,
     rows = []
     for i, path in enumerate(files, 1):
         try:
-            pr = praat_reference(path, fmin, fmax, formant_max)
+            f0_ref = praat_f0_reference(path, fmin, fmax)
             report, track = speechlab_measure(path)
-            f0cmp = compare_f0(track, pr)
+            praat_report = praat_backend_measure(path, formant_max)
+            f0cmp = compare_f0(track, f0_ref)
         except Exception as exc:  # noqa: BLE001 — one bad file must not kill the run
             print(f"[{i}/{len(files)}] SKIP {os.path.basename(path)}: {exc}")
             continue
         vq = report.get("voice_quality", {})
         fmt = report.get("formants", {})
+        pv = praat_report.get("voice_quality", {})
+        pf = praat_report.get("formants", {})
         row = {
             "file": os.path.basename(path),
             "sl_f0_median": report["pitch"].get("f0_median_hz", float("nan")),
-            "praat_f0_median": pr["f0_median"],
+            "praat_f0_median": praat_report["pitch"].get(
+                "f0_median_hz", float("nan")),
             "f0_mae_hz": f0cmp.get("mae_hz", float("nan")),
             "f0_mae_cents": f0cmp.get("mae_cents", float("nan")),
             "n_frames": f0cmp.get("n_frames", 0),
             "sl_f1": fmt.get("F1_hz", float("nan")),
             "sl_f2": fmt.get("F2_hz", float("nan")),
             "sl_f3": fmt.get("F3_hz", float("nan")),
-            "praat_f1": pr["f1"], "praat_f2": pr["f2"], "praat_f3": pr["f3"],
+            "praat_f1": pf.get("F1_hz", float("nan")),
+            "praat_f2": pf.get("F2_hz", float("nan")),
+            "praat_f3": pf.get("F3_hz", float("nan")),
             "sl_jitter": vq.get("jitter_local_percent", float("nan")),
-            "praat_jitter": pr["jitter"],
+            "praat_jitter": pv.get("jitter_local_percent", float("nan")),
             "sl_shimmer": vq.get("shimmer_local_db", float("nan")),
-            "praat_shimmer": pr["shimmer"],
+            "praat_shimmer": pv.get("shimmer_local_db", float("nan")),
             "sl_hnr": report.get("hnr_db", float("nan")),
-            "praat_hnr": pr["hnr"],
+            "praat_hnr": praat_report.get("hnr_db", float("nan")),
         }
         rows.append(row)
         print(f"[{i}/{len(files)}] {row['file']}: "

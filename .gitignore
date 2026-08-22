@@ -17,3 +17,4 @@ htmlcov/
 !tests/data/**
 web/data/
 bench_results/
+.trae-html-share-packages/
