@@ -1,0 +1,1326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpeechLab Agent — 语音科学 AI 助手</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel2: #1e2230;
+    --border: #2a2f3e;
+    --text: #e8eaf0;
+    --muted: #9aa1b2;
+    --accent: #5b8cff;
+    --accent2: #7c5bff;
+    --user-bubble: #2b3a67;
+    --bot-bubble: #1e2230;
+    --danger: #ff6b6b;
+    --ok: #4cd97b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  .brand h1 { font-size: 16px; font-weight: 600; }
+  .brand small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
+  .header-actions { display: flex; gap: 8px; }
+  .btn {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn:hover { background: #262b3d; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #4a7bf0; }
+  .btn.primary:disabled { opacity: .5; cursor: not-allowed; }
+
+  #chat {
+    flex: 1; overflow-y: auto;
+    padding: 24px 0;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .inner { width: 100%; max-width: 820px; margin: 0 auto; padding: 0 20px; }
+
+  .msg { display: flex; gap: 10px; max-width: 100%; }
+  .msg.user { flex-direction: row-reverse; }
+  .avatar {
+    width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 16px;
+  }
+  .msg.bot .avatar { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+  .msg.user .avatar { background: #3a4152; }
+  .bubble {
+    padding: 12px 16px; border-radius: 12px;
+    line-height: 1.65; font-size: 14px;
+    word-break: break-word;
+    max-width: 78%;
+  }
+  .msg.user .bubble { background: var(--user-bubble); border-bottom-right-radius: 4px; white-space: pre-wrap; }
+  .msg.bot .bubble { background: var(--bot-bubble); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+
+  /* markdown rendering inside bot bubbles */
+  .bubble p { margin: 0 0 8px; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 {
+    margin: 12px 0 6px; font-size: 15px; line-height: 1.4;
+  }
+  .bubble h1 { font-size: 17px; } .bubble h2 { font-size: 16px; }
+  .bubble ul, .bubble ol { margin: 4px 0 8px; padding-left: 22px; }
+  .bubble li { margin: 3px 0; }
+  .bubble code {
+    background: #2b3145; border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
+    color: #9ecbff;
+  }
+  .bubble pre {
+    background: #12141c; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+  }
+  .bubble pre code { background: none; padding: 0; color: var(--text); }
+  .bubble a { color: var(--accent); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  .bubble table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+  .bubble th, .bubble td { border: 1px solid var(--border); padding: 5px 10px; }
+  .bubble th { background: #262b3d; }
+
+  /* report extras: quality flags, compare table, contour chart */
+  .flags { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .flag {
+    border-radius: 6px; padding: 3px 10px; font-size: 12px;
+    background: #262b3d; color: var(--muted);
+  }
+  .flag.ok { color: var(--ok); }
+  .flag.warn { color: #f0b429; }
+  .flag.bad { color: var(--danger); }
+  .cmp-wrap { overflow-x: auto; margin: 8px 0; }
+  .cmp-wrap table { width: 100%; }
+  .cmp-wrap td, .cmp-wrap th { white-space: nowrap; }
+  .cmp-wrap td.best { color: var(--ok); font-weight: 600; }
+  .contour-box { margin: 10px 0 4px; }
+  .contour-box svg { width: 100%; height: auto; display: block;
+    background: #12141c; border: 1px solid var(--border); border-radius: 8px; }
+  .contour-box canvas { width: 100%; display: block;
+    background: #0a0c12; border: 1px solid var(--border); border-radius: 8px; }
+  .contour-title { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .icon-btn.rec { color: var(--danger); border-color: var(--danger); animation: recpulse 1.2s infinite; }
+  @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .exp-btn {
+    margin-top: 8px; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--muted); font-size: 12px; padding: 4px 12px; cursor: pointer;
+  }
+  .exp-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  /* trend modal */
+  .trend-chart { margin: 10px 0; }
+  .trend-chart svg { width: 100%; height: auto; display: block; }
+  .trend-chart .tc-title { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .trend-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  .trend-table th, .trend-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+  .trend-table th { background: #262b3d; }
+  .msg.error .bubble { border-color: var(--danger); color: var(--danger); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #2b3145; border: 1px solid var(--border);
+    border-radius: 20px; padding: 4px 12px; font-size: 12px; color: var(--text);
+  }
+  .chip .x { cursor: pointer; color: var(--muted); font-weight: bold; }
+  .chip .x:hover { color: var(--danger); }
+
+  .typing { display: inline-flex; gap: 4px; padding: 4px 0; }
+  .typing span {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+    animation: blink 1.2s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+
+  .welcome {
+    text-align: center; padding: 48px 20px; color: var(--muted);
+  }
+  .welcome h2 { color: var(--text); font-size: 22px; margin-bottom: 10px; }
+  .welcome p { font-size: 14px; max-width: 520px; margin: 0 auto 20px; }
+  .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .suggestion {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 16px; font-size: 13px;
+    cursor: pointer; color: var(--text); transition: border-color .15s;
+  }
+  .suggestion:hover { border-color: var(--accent); }
+
+  footer {
+    flex-shrink: 0;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 14px 20px;
+  }
+  .composer {
+    max-width: 820px; margin: 0 auto;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #pending-files { display: flex; flex-wrap: wrap; gap: 6px; }
+  .input-row { display: flex; gap: 8px; align-items: flex-end; }
+  #input {
+    flex: 1; resize: none;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 11px 14px; font-size: 14px; font-family: inherit;
+    max-height: 140px; line-height: 1.5;
+  }
+  #input:focus { outline: none; border-color: var(--accent); }
+  .icon-btn {
+    width: 42px; height: 42px; flex-shrink: 0;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; color: var(--muted); font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--accent); }
+  #send {
+    width: 42px; height: 42px; flex-shrink: 0;
+    background: var(--accent); border: none; border-radius: 10px;
+    color: #fff; font-size: 17px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #send:hover { background: #4a7bf0; }
+  #send:disabled { opacity: .4; cursor: not-allowed; }
+  .hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* settings modal */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: center; justify-content: center; z-index: 10;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px; width: 420px; max-width: 92vw;
+  }
+  .modal h3 { font-size: 16px; margin-bottom: 4px; }
+  .modal p { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  .field input {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 12px; font-size: 13px;
+  }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  .key-status { font-size: 12px; margin-bottom: 14px; }
+  .key-status.ok { color: var(--ok); }
+  .key-status.warn { color: #f0b429; }
+
+  /* history modal items */
+  #history-list { max-height: 50vh; overflow-y: auto; }
+  .hist-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 6px; cursor: pointer;
+  }
+  .hist-item:hover { border-color: var(--accent); }
+  .hist-title { font-size: 13px; max-width: 280px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .hist-del { background: none; border: none; cursor: pointer; font-size: 14px;
+    color: var(--muted); }
+  .hist-del:hover { color: var(--danger); }
+
+  /* live streaming + tool status */
+  .tool-status { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .tool-status.done { color: var(--ok); }
+  .cursor-blink { display: inline-block; width: 7px; height: 14px;
+    background: var(--accent); vertical-align: -2px; margin-left: 2px;
+    animation: recpulse 1s infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="logo">🎙️</div>
+    <div>
+      <h1>SpeechLab Agent</h1>
+      <small>语音科学 AI 研究助手 · F0 / 共振峰 / Jitter / HNR</small>
+    </div>
+  </div>
+  <div class="header-actions">
+    <button class="btn" id="btn-analyze" title="上传音频直接做声学分析（无需 API Key）">📊 直接分析</button>
+    <button class="btn" id="btn-trend" title="历史测量趋势（治疗前后对比，跨设备同步）">📈 趋势</button>
+    <button class="btn" id="btn-history" title="历史对话（跨设备恢复）">🕘 历史</button>
+    <button class="btn" id="btn-reset">🗑️ 新对话</button>
+    <button class="btn" id="btn-settings">⚙️ 设置</button>
+  </div>
+</header>
+
+<div id="chat">
+  <div class="inner" id="messages">
+    <div class="welcome" id="welcome">
+      <h2>👋 你好，我是 SpeechLab Agent</h2>
+      <p>我可以回答语音科学问题（F0、共振峰、jitter/shimmer、HNR、实验设计等），
+         也可以<b style="color:var(--text)">上传音频文件</b>，我会实际测量声学参数再给出有依据的解读。</p>
+      <div class="suggestions">
+        <div class="suggestion">什么是 jitter 和 shimmer？正常范围是多少？</div>
+        <div class="suggestion">如何设计一个说话人无关的语音评估实验？</div>
+        <div class="suggestion">HNR 偏低说明什么？</div>
+        <div class="suggestion">📎 上传一段音频，帮我分析嗓音质量</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="composer">
+    <div id="pending-files"></div>
+    <div class="input-row">
+      <button class="icon-btn" id="btn-record" title="浏览器录音（最长 30 秒，录完自动分析）">🎤</button>
+      <button class="icon-btn" id="btn-attach" title="上传音频文件 (wav/mp3/flac/ogg)">📎</button>
+      <textarea id="input" rows="1" placeholder="输入你的问题，Enter 发送，Shift+Enter 换行…"></textarea>
+      <button id="send" title="发送">➤</button>
+    </div>
+    <div class="hint">🎤 可直接录音 · 支持上传 wav / mp3 / flac / ogg · 模型会调用本地声学分析工具测量后再回答</div>
+  </div>
+</footer>
+
+<input type="file" id="file-input" accept=".wav,.wave,.mp3,.flac,.ogg,audio/*" multiple hidden>
+<input type="file" id="analyze-input" accept=".wav,.wave,.mp3,.flac,.ogg,audio/*" multiple hidden>
+
+<div class="modal-bg" id="trend-modal">
+  <div class="modal">
+    <h3>📈 测量趋势（本机 + 服务器跨设备同步）</h3>
+    <div id="trend-body"></div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn" id="trend-clear">🗑️ 清空历史</button>
+      <button class="btn primary" id="trend-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="history-modal">
+  <div class="modal">
+    <h3>🕘 历史对话</h3>
+    <p>对话自动保存在服务器上，同一浏览器身份可在任何设备恢复查看。</p>
+    <div id="history-list"></div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn primary" id="history-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="auth-modal">
+  <div class="modal">
+    <h3>🔒 需要访问密码</h3>
+    <p>本服务器开启了访问保护，请输入访问密码（仅保存在你的浏览器本地）。</p>
+    <div class="field">
+      <label>访问密码</label>
+      <input type="password" id="auth-pass" placeholder="访问密码">
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="auth-save">进入</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="settings-modal">
+  <div class="modal">
+    <h3>⚙️ API 设置</h3>
+    <p>连接任意 OpenAI 兼容接口。Key 只保存在你的浏览器本地，不会上传到别处。</p>
+    <div class="key-status" id="key-status"></div>
+    <div class="field">
+      <label>API Key</label>
+      <input type="password" id="cfg-key" placeholder="sk-...">
+    </div>
+    <div class="field">
+      <label>Base URL</label>
+      <input type="text" id="cfg-url" placeholder="https://api.openai.com/v1">
+    </div>
+    <div class="field">
+      <label>模型</label>
+      <input type="text" id="cfg-model" placeholder="gpt-4o-mini">
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="cfg-cancel">取消</button>
+      <button class="btn primary" id="cfg-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+let conversationId = null;   // server-side persisted conversation
+let pendingFiles = [];       // [{stored, original}]
+let busy = false;
+
+// ---------- identity / auth ----------
+// Anonymous browser identity: lets the server group conversations and
+// measurements so history/trends follow the user across devices.
+function getUserKey() {
+  let k = localStorage.getItem("sl_user");
+  if (!k) {
+    k = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+    localStorage.setItem("sl_user", k);
+  }
+  return k;
+}
+function authToken() { return localStorage.getItem("sl_auth") || ""; }
+function apiHeaders(json = false) {
+  const h = { "X-User-Key": getUserKey() };
+  if (authToken()) h["X-Auth-Token"] = authToken();
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+function requireAuth() {
+  if (authToken()) return false;
+  $("auth-modal").classList.add("open");
+  $("auth-pass").focus();
+  return true;
+}
+$("auth-save").onclick = () => {
+  localStorage.setItem("sl_auth", $("auth-pass").value);
+  $("auth-modal").classList.remove("open");
+  location.reload();
+};
+$("auth-pass").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("auth-save").click();
+});
+
+// ---------- settings ----------
+const cfg = {
+  get key()   { return localStorage.getItem("sl_key") || ""; },
+  get url()   { return localStorage.getItem("sl_url") || ""; },
+  get model() { return localStorage.getItem("sl_model") || ""; },
+};
+
+async function loadServerConfig() {
+  try {
+    const r = await fetch("/api/config");
+    const d = await r.json();
+    if (d.auth_required) requireAuth();
+    const el = $("key-status");
+    if (d.has_server_key) {
+      el.textContent = "✓ 服务器已配置 API Key，可直接使用（也可在下方覆盖）";
+      el.className = "key-status ok";
+    } else {
+      el.textContent = "⚠ 服务器未配置 API Key，请在下方填写自己的 Key";
+      el.className = "key-status warn";
+    }
+    if (!cfg.url) $("cfg-url").placeholder = d.base_url;
+    if (!cfg.model) $("cfg-model").placeholder = d.model;
+  } catch (e) { /* ignore */ }
+}
+
+$("btn-settings").onclick = () => {
+  $("cfg-key").value = cfg.key;
+  $("cfg-url").value = cfg.url;
+  $("cfg-model").value = cfg.model;
+  $("settings-modal").classList.add("open");
+};
+$("cfg-cancel").onclick = () => $("settings-modal").classList.remove("open");
+$("cfg-save").onclick = () => {
+  localStorage.setItem("sl_key", $("cfg-key").value.trim());
+  localStorage.setItem("sl_url", $("cfg-url").value.trim());
+  localStorage.setItem("sl_model", $("cfg-model").value.trim());
+  $("settings-modal").classList.remove("open");
+};
+$("settings-modal").onclick = (e) => {
+  if (e.target === $("settings-modal")) $("settings-modal").classList.remove("open");
+};
+
+// ---------- markdown rendering ----------
+function mdToHtml(src) {
+  const codes = [];
+  src = src.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, code) => {
+    codes.push('<pre><code>' + escapeHtml(code.replace(/\n$/, '')) + '</code></pre>');
+    return '\x00' + (codes.length - 1) + '\x00';
+  });
+  src = escapeHtml(src);
+  src = src.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  src = src.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  src = src.replace(/(^|[\s(（])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  src = src.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+  const lines = src.split('\n');
+  const out = [];
+  let i = 0, para = [], list = null;
+
+  const flushPara = () => { if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
+  const flushList = () => { if (list) { out.push(list === 'ul' ? '</ul>' : '</ol>'); list = null; } };
+
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+
+    const cb = trimmed.match(/^\x00(\d+)\x00$/);
+    if (cb) { flushPara(); flushList(); out.push(codes[+cb[1]]); i++; continue; }
+    if (!trimmed) { flushPara(); flushList(); i++; continue; }
+
+    const h = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushPara(); flushList(); const n = h[1].length; out.push(`<h${n}>${h[2]}</h${n}>`); i++; continue; }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { flushPara(); flushList(); out.push('<hr>'); i++; continue; }
+
+    const ul = trimmed.match(/^[-*]\s+(.*)$/);
+    if (ul) { flushPara(); if (list !== 'ul') { flushList(); out.push('<ul>'); list = 'ul'; }
+      out.push('<li>' + ul[1] + '</li>'); i++; continue; }
+    const ol = trimmed.match(/^\d+[.)]\s+(.*)$/);
+    if (ol) { flushPara(); if (list !== 'ol') { flushList(); out.push('<ol>'); list = 'ol'; }
+      out.push('<li>' + ol[1] + '</li>'); i++; continue; }
+
+    if (trimmed.includes('|') && i + 1 < lines.length &&
+        /^\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1].trim()) && lines[i + 1].includes('-')) {
+      flushPara(); flushList();
+      const parseRow = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+      const head = parseRow(trimmed);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().includes('|')) { rows.push(parseRow(lines[i])); i++; }
+      out.push('<table><thead><tr>' + head.map(c => `<th>${c}</th>`).join('') +
+        '</tr></thead><tbody>' +
+        rows.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('') +
+        '</tbody></table>');
+      continue;
+    }
+
+    para.push(trimmed);
+    i++;
+  }
+  flushPara(); flushList();
+  return out.join('');
+}
+
+// ---------- chat rendering ----------
+function addMessage(role, text, files) {
+  $("welcome")?.remove();
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = role === "user" ? "🧑" : "🎙️";
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  if (role === "bot") bubble.innerHTML = mdToHtml(text);
+  else bubble.textContent = text;
+  if (files && files.length) {
+    const chips = document.createElement("div");
+    chips.className = "chips";
+    for (const f of files) {
+      const c = document.createElement("span");
+      c.className = "chip";
+      c.textContent = "🎵 " + f;
+      chips.appendChild(c);
+    }
+    bubble.appendChild(chips);
+  }
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  scrollBottom();
+  return bubble;
+}
+
+function addTyping() {
+  $("welcome")?.remove();
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.id = "typing-msg";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>
+    <div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  $("messages").appendChild(wrap);
+  scrollBottom();
+}
+function removeTyping() { $("typing-msg")?.remove(); }
+
+function scrollBottom() {
+  const chat = $("chat");
+  chat.scrollTop = chat.scrollHeight;
+}
+
+// ---------- file attach ----------
+$("btn-attach").onclick = () => $("file-input").click();
+$("file-input").onchange = async (e) => {
+  for (const file of e.target.files) await uploadFile(file);
+  e.target.value = "";
+};
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  if (sessionId) fd.append("session_id", sessionId);
+  try {
+    const r = await fetch("/api/upload", { method: "POST", body: fd, headers: apiHeaders() });
+    if (r.status === 401) { requireAuth(); return; }
+    const d = await r.json();
+    if (!r.ok) { addMessage("error", d.error || "上传失败"); return; }
+    sessionId = d.session_id;
+    pendingFiles.push({ stored: d.stored, original: d.original });
+    renderPending();
+  } catch (err) {
+    addMessage("error", "上传失败：" + err);
+  }
+}
+
+function renderPending() {
+  const box = $("pending-files");
+  box.innerHTML = "";
+  pendingFiles.forEach((f, i) => {
+    const c = document.createElement("span");
+    c.className = "chip";
+    c.innerHTML = `🎵 ${escapeHtml(f.original)} <span class="x" data-i="${i}">✕</span>`;
+    c.querySelector(".x").onclick = () => { pendingFiles.splice(i, 1); renderPending(); };
+    box.appendChild(c);
+  });
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (m) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
+// ---------- send (SSE streaming) ----------
+function liveBubble() {
+  removeTyping();
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const tools = document.createElement("div");
+  const mdc = document.createElement("div");
+  bubble.appendChild(tools);
+  bubble.appendChild(mdc);
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  scrollBottom();
+  return { bubble, tools, mdc };
+}
+
+async function send(text) {
+  if (busy) return;
+  const message = (text ?? $("input").value).trim();
+  if (!message && pendingFiles.length === 0) return;
+
+  busy = true;
+  $("send").disabled = true;
+  addMessage("user", message || "请分析我上传的音频", pendingFiles.map(f => f.original));
+  $("input").value = "";
+  autoGrow();
+  const attached = pendingFiles.map(f => f.stored);
+  pendingFiles = [];
+  renderPending();
+  addTyping();
+
+  let live = null, acc = "";
+  try {
+    const res = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: apiHeaders(true),
+      body: JSON.stringify({
+        message, attached,
+        session_id: sessionId, conversation_id: conversationId,
+        api_key: cfg.key, base_url: cfg.url, model: cfg.model,
+      }),
+    });
+    if (res.status === 401) { removeTyping(); requireAuth(); return; }
+    if (!res.ok || !res.body) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${res.status}`);
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const handleEvent = (ev) => {
+      if (ev.type === "meta") {
+        sessionId = ev.session_id || sessionId;
+        conversationId = ev.conversation_id || conversationId;
+      } else if (ev.type === "delta") {
+        if (!live) live = liveBubble();
+        acc += ev.text || "";
+        live.mdc.innerHTML = mdToHtml(acc) + '<span class="cursor-blink"></span>';
+        scrollBottom();
+      } else if (ev.type === "tool") {
+        if (!live) live = liveBubble();
+        if (ev.status === "start") {
+          const row = document.createElement("div");
+          row.className = "tool-status";
+          row.textContent = `🔧 调用 ${ev.name} …`;
+          live.tools.appendChild(row);
+        } else {
+          const open = live.tools.querySelectorAll(".tool-status:not(.done)");
+          if (open.length) {
+            open[open.length - 1].classList.add("done");
+            open[open.length - 1].textContent = `🔧 ${ev.name} ✓`;
+          }
+        }
+      } else if (ev.type === "done") {
+        removeTyping();
+        if (live) live.mdc.innerHTML = mdToHtml(ev.answer || acc);
+        else addMessage("bot", ev.answer || acc);
+        scrollBottom();
+      } else if (ev.type === "error") {
+        removeTyping();
+        if (live) live.mdc.innerHTML = mdToHtml(acc || "");
+        addMessage("error", ev.error || "请求失败");
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const line = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        try { handleEvent(JSON.parse(line.slice(5).trim())); } catch (e) { /* skip */ }
+      }
+    }
+  } catch (err) {
+    removeTyping();
+    addMessage("error", "网络错误：" + (err.message || err));
+  } finally {
+    busy = false;
+    $("send").disabled = false;
+    $("input").focus();
+  }
+}
+
+$("send").onclick = () => send();
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+function autoGrow() {
+  const t = $("input");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 140) + "px";
+}
+$("input").addEventListener("input", autoGrow);
+
+// suggestions
+document.querySelectorAll(".suggestion").forEach((el) => {
+  el.onclick = () => {
+    const t = el.textContent.trim();
+    if (t.startsWith("📎")) $("file-input").click();
+    else send(t);
+  };
+});
+
+// ---------- reset ----------
+$("btn-reset").onclick = async () => {
+  if (sessionId) {
+    try { await fetch("/api/reset", {
+      method: "POST", headers: apiHeaders(true),
+      body: JSON.stringify({ session_id: sessionId }) }); } catch (e) {}
+  }
+  sessionId = null;
+  conversationId = null;
+  pendingFiles = [];
+  renderPending();
+  $("messages").innerHTML = "";
+  location.reload();
+};
+
+// ---------- history (server-side conversations) ----------
+$("btn-history").onclick = async () => {
+  await loadHistoryList();
+  $("history-modal").classList.add("open");
+};
+$("history-close").onclick = () => $("history-modal").classList.remove("open");
+$("history-modal").onclick = (e) => {
+  if (e.target === $("history-modal")) $("history-modal").classList.remove("open");
+};
+
+async function loadHistoryList() {
+  const box = $("history-list");
+  box.innerHTML = '<p style="color:var(--muted)">加载中…</p>';
+  try {
+    const r = await fetch("/api/history", { headers: apiHeaders() });
+    if (r.status === 401) { requireAuth(); return; }
+    const d = await r.json();
+    const list = d.conversations || [];
+    if (!list.length) {
+      box.innerHTML = '<p style="color:var(--muted)">暂无历史对话。开始聊天后会自动保存。</p>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const c of list) {
+      const item = document.createElement("div");
+      item.className = "hist-item";
+      const left = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "hist-title";
+      title.textContent = c.title || "(无标题)";
+      const time = document.createElement("div");
+      time.className = "hist-time";
+      time.textContent = new Date((c.updated_at || 0) * 1000).toLocaleString();
+      left.appendChild(title); left.appendChild(time);
+      const del = document.createElement("button");
+      del.className = "hist-del";
+      del.textContent = "🗑️";
+      del.title = "删除该对话";
+      del.onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          await fetch("/api/history", {
+            method: "DELETE", headers: apiHeaders(true),
+            body: JSON.stringify({ conversation_id: c.id }) });
+        } catch (err) { /* noop */ }
+        loadHistoryList();
+      };
+      item.appendChild(left); item.appendChild(del);
+      item.onclick = () => openConversation(c.id);
+      box.appendChild(item);
+    }
+  } catch (e) {
+    box.innerHTML = '<p style="color:var(--danger)">加载失败：' + escapeHtml(String(e)) + '</p>';
+  }
+}
+
+async function openConversation(id) {
+  try {
+    const r = await fetch(`/api/history?conversation_id=${encodeURIComponent(id)}`,
+      { headers: apiHeaders() });
+    const d = await r.json();
+    if (!r.ok) { addMessage("error", d.error || "加载失败"); return; }
+    $("history-modal").classList.remove("open");
+    $("messages").innerHTML = "";
+    conversationId = id;
+    for (const m of d.messages || []) {
+      if (m.role === "user") addMessage("user", m.content, m.files || []);
+      else if (m.role === "assistant") addMessage("bot", m.content);
+    }
+    if (!(d.messages || []).length) addMessage("bot", "（该对话没有消息）");
+  } catch (e) {
+    addMessage("error", "加载失败：" + e);
+  }
+}
+
+// ---------- direct analysis (no API key) ----------
+$("btn-analyze").onclick = () => $("analyze-input").click();
+$("analyze-input").onchange = async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  if (files.length) analyzeFiles(files, false);
+};
+
+async function analyzeFiles(files, fromRecord) {
+  busy = true;
+  addMessage("user", `${fromRecord ? "🎤" : "📊"} 直接声学分析：${files.map(f => f.name).join("、")}`);
+  addTyping();
+  try {
+    const results = await Promise.all(files.map(async (file) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch("/api/analyze", { method: "POST", body: fd, headers: apiHeaders() });
+      return { file, d: await r.json(), ok: r.ok };
+    }));
+    const reports = [];
+    for (const { file, d, ok } of results) {
+      if (!ok) addMessage("error", `${file.name}：${d.error || "分析失败"}`);
+      else reports.push(d);
+    }
+    removeTyping();
+    if (reports.length === 1) {
+      addReportMessage(reports[0]);
+    } else if (reports.length > 1) {
+      addCompareMessage(reports);
+      reports.forEach(saveTrend);
+    }
+  } catch (err) {
+    removeTyping();
+    addMessage("error", "分析失败：" + err);
+  } finally { busy = false; }
+};
+
+// reference ranges used for the quality/normality flags
+const NORM = {
+  jitter: { warn: 1.0, bad: 2.0, lowerBetter: true },      // %
+  shimmer: { warn: 0.35, bad: 1.0, lowerBetter: true },    // dB
+  hnr: { warn: 20, bad: 10, lowerBetter: false },          // dB
+  snr: { warn: 20, bad: 10, lowerBetter: false },          // dB
+};
+function level(val, spec) {
+  if (val == null || isNaN(val)) return "na";
+  if (spec.lowerBetter) return val < spec.warn ? "ok" : val < spec.bad ? "warn" : "bad";
+  return val > spec.warn ? "ok" : val > spec.bad ? "warn" : "bad";
+}
+function qualityFlags(r) {
+  const p = r.pitch || {}, v = r.voice_quality || {}, q = r.recording_quality || {};
+  const flags = [];
+  const add = (lv, text) => flags.push({ lv, text });
+  if (p.n_voiced_frames) {
+    add(p.voiced_ratio > 0.5 ? "ok" : "warn", `浊音占比 ${(p.voiced_ratio * 100).toFixed(0)}%`);
+  } else add("warn", "未检测到浊音");
+  if (v.n_periods) {
+    add(level(v.jitter_local_percent, NORM.jitter), `jitter ${v.jitter_local_percent?.toFixed(2)}%（<1% 正常）`);
+    add(level(v.shimmer_local_db, NORM.shimmer), `shimmer ${v.shimmer_local_db?.toFixed(2)}dB（<0.35 正常）`);
+  }
+  add(level(r.hnr_db, NORM.hnr), `HNR ${r.hnr_db}dB（>20 稳定）`);
+  add(level(q.snr_db, NORM.snr), `信噪比 ${q.snr_db}dB（>20 良好）`);
+  (q.issues || []).forEach(i => add("bad", i));
+  return flags;
+}
+
+function addReportMessage(r) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = mdToHtml(formatReport(r));
+  bubble.appendChild(flagsEl(qualityFlags(r)));
+  if (r.pitch_contour) bubble.appendChild(contourEl(r.pitch_contour, r.file));
+  if (r.spectrogram) bubble.appendChild(spectrogramEl(r.spectrogram, r.file));
+  bubble.appendChild(exportBtn(r));
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  saveTrend(r);
+  scrollBottom();
+}
+
+function flagsEl(flags) {
+  const box = document.createElement("div");
+  box.className = "flags";
+  for (const f of flags) {
+    const el = document.createElement("span");
+    el.className = `flag ${f.lv}`;
+    el.textContent = `${f.lv === "ok" ? "✓" : f.lv === "bad" ? "✗" : f.lv === "warn" ? "△" : "·"} ${f.text}`;
+    box.appendChild(el);
+  }
+  return box;
+}
+
+function addCompareMessage(reports) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  wrap.innerHTML = `<div class="avatar">🎙️</div>`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = `<p><strong>📊 ${reports.length} 个录音对比</strong>（绿色为该指标最优）</p>`;
+
+  const rows = [
+    ["F0 中位数 (Hz)", r => r.pitch?.f0_median_hz, v => v?.toFixed(1), null],
+    ["F0 标准差 (Hz)", r => r.pitch?.f0_std_hz, v => v?.toFixed(1), "min"],
+    ["浊音占比 (%)", r => (r.pitch?.voiced_ratio ?? 0) * 100, v => v?.toFixed(0), "max"],
+    ["Jitter (%)", r => r.voice_quality?.jitter_local_percent, v => v?.toFixed(2), "min"],
+    ["Shimmer (dB)", r => r.voice_quality?.shimmer_local_db, v => v?.toFixed(2), "min"],
+    ["HNR (dB)", r => r.hnr_db, v => v?.toFixed(1), "max"],
+    ["信噪比 (dB)", r => r.recording_quality?.snr_db, v => v?.toFixed(1), "max"],
+    ["F1/F2/F3 (Hz)", r => r.formants ? [r.formants.F1_hz, r.formants.F2_hz, r.formants.F3_hz] : null,
+      v => v ? v.map(x => x.toFixed(0)).join("/") : "—", null],
+  ];
+  let html = '<div class="cmp-wrap"><table><thead><tr><th>指标</th>' +
+    reports.map(r => `<th>${escapeHtml(r.file)}</th>`).join("") + "</tr></thead><tbody>";
+  for (const [label, get, fmt, best] of rows) {
+    const vals = reports.map(get);
+    const nums = vals.filter(v => v != null && !isNaN(v) && typeof v === "number");
+    const bestVal = best === "min" ? Math.min(...nums) : best === "max" ? Math.max(...nums) : null;
+    html += `<tr><td>${label}</td>` + vals.map(v => {
+      const isBest = bestVal != null && v === bestVal && nums.length > 1;
+      return `<td class="${isBest ? "best" : ""}">${v == null || isNaN(v) ? "—" : fmt(v)}</td>`;
+    }).join("") + "</tr>";
+  }
+  html += "</tbody></table></div>";
+  bubble.innerHTML += html;
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+
+  // one contour chart per file below the table
+  for (const r of reports) {
+    if (r.pitch_contour) {
+      const w2 = document.createElement("div");
+      w2.className = "msg bot";
+      w2.innerHTML = `<div class="avatar">🎙️</div>`;
+      const b2 = document.createElement("div");
+      b2.className = "bubble";
+      b2.appendChild(contourEl(r.pitch_contour, r.file));
+      w2.appendChild(b2);
+      $("messages").appendChild(w2);
+    }
+  }
+  scrollBottom();
+}
+
+function contourEl(contour, name) {
+  const box = document.createElement("div");
+  box.className = "contour-box";
+  const title = document.createElement("div");
+  title.className = "contour-title";
+  title.textContent = `基频曲线 — ${name}`;
+  box.appendChild(title);
+
+  const W = 640, H = 180, padL = 44, padB = 22, padT = 10, padR = 8;
+  const t = contour.times_s, f = contour.f0_hz;
+  const pts = t.map((x, i) => [x, f[i]]).filter(p => p[1] != null);
+  if (!pts.length) { title.textContent += "（无浊音帧）"; return box; }
+  const tMax = Math.max(...t, 0.001);
+  const fVals = pts.map(p => p[1]);
+  let fMin = Math.min(...fVals), fMax = Math.max(...fVals);
+  if (fMax - fMin < 20) { const c = (fMax + fMin) / 2; fMin = c - 10; fMax = c + 10; }
+  const X = (x) => padL + (x / tMax) * (W - padL - padR);
+  const Y = (y) => padT + (1 - (y - fMin) / (fMax - fMin)) * (H - padT - padB);
+
+  // split into continuous voiced runs
+  let paths = "", run = [];
+  const flush = () => {
+    if (run.length > 1) {
+      paths += `<polyline fill="none" stroke="var(--accent)" stroke-width="1.8" points="` +
+        run.map(p => `${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ") + `"/>`;
+    }
+    run = [];
+  };
+  t.forEach((x, i) => { if (f[i] != null) run.push([x, f[i]]); else flush(); });
+  flush();
+
+  const gridY = [fMin, (fMin + fMax) / 2, fMax].map(v =>
+    `<line x1="${padL}" x2="${W - padR}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--border)" stroke-width="1"/>
+     <text x="${padL - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${v.toFixed(0)}</text>`).join("");
+  const gridX = [0, tMax / 2, tMax].map(v =>
+    `<text x="${X(v)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="var(--muted)">${v.toFixed(1)}s</text>`).join("");
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = gridY + gridX + paths;
+  box.appendChild(svg);
+  return box;
+}
+
+function formatReport(r) {
+  const p = r.pitch || {}, v = r.voice_quality || {}, q = r.recording_quality || {};
+  let out = `📊 ${r.file} 声学分析报告\n`;
+  out += `时长：${r.duration_s} s @ ${r.sample_rate_hz} Hz\n\n`;
+  if (p.n_voiced_frames) {
+    out += `【F0 基频】\n  中位数 ${p.f0_median_hz?.toFixed(1)} Hz（均值 ${p.f0_mean_hz?.toFixed(1)}，标准差 ${p.f0_std_hz?.toFixed(1)}）\n  范围 ${p.f0_min_hz?.toFixed(0)}–${p.f0_max_hz?.toFixed(0)} Hz，浊音帧占比 ${(p.voiced_ratio * 100).toFixed(0)}%\n`;
+  } else {
+    out += "【F0 基频】未检测到浊音帧\n";
+  }
+  if (v.n_periods) {
+    out += `\n【嗓音质量】（${v.n_periods} 个周期）\n  Jitter: ${v.jitter_local_percent?.toFixed(2)} %\n  Shimmer: ${v.shimmer_local_db?.toFixed(2)} dB\n`;
+  }
+  out += `\n【HNR】${r.hnr_db} dB\n`;
+  if (r.formants) {
+    out += `\n【共振峰】F1 ${r.formants.F1_hz?.toFixed(0)} Hz，F2 ${r.formants.F2_hz?.toFixed(0)} Hz，F3 ${r.formants.F3_hz?.toFixed(0)} Hz\n`;
+  }
+  if (r.voiced_segments?.length) {
+    out += `\n【浊音段】` + r.voiced_segments.map(s => `${s.start_s}–${s.end_s}s`).join("，") + "\n";
+  }
+  const ps = r.pause_stats || {};
+  if (ps.speech_s != null) {
+    out += `\n【时间结构】语音 ${ps.speech_s}s，静音占比 ${((ps.silence_ratio || 0) * 100).toFixed(0)}%`;
+    if (ps.n_pauses) out += `，${ps.n_pauses} 次停顿（均 ${ps.pause_mean_s}s，最长 ${ps.pause_max_s}s）`;
+    if (ps.articulation_rate_syl_per_s) out += `，估算发音速率 ${ps.articulation_rate_syl_per_s} 音节/s`;
+    out += "\n";
+  }
+  out += "\n💡 想让我解读这些数据的含义？把文件用 📎 附上并提问即可。";
+  return out;
+}
+
+// ---------- browser recording ----------
+let rec = null;
+$("btn-record").onclick = toggleRecord;
+async function toggleRecord() {
+  if (rec) { stopRecording(); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (e) { addMessage("error", "无法访问麦克风：" + e.message); return; }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(proc); proc.connect(ctx.destination);
+  rec = { stream, ctx, proc, chunks, t0: Date.now(), timer: null };
+  $("btn-record").textContent = "⏹";
+  $("btn-record").classList.add("rec");
+  addMessage("user", "🎤 开始录音（再次点击结束，最长 30 秒）…");
+  rec.timer = setInterval(() => {
+    if (Date.now() - rec.t0 >= 30000) stopRecording();
+  }, 300);
+}
+function stopRecording() {
+  if (!rec) return;
+  clearInterval(rec.timer);
+  const { stream, ctx, proc, chunks, t0 } = rec;
+  rec = null;
+  try { proc.disconnect(); stream.getTracks().forEach(t => t.stop()); ctx.close(); } catch (e) { /* noop */ }
+  $("btn-record").textContent = "🎤";
+  $("btn-record").classList.remove("rec");
+  const secs = Math.round((Date.now() - t0) / 1000);
+  const len = chunks.reduce((a, c) => a + c.length, 0);
+  if (len < ctx.sampleRate * 0.5 || secs < 1) { addMessage("error", "录音太短，请至少录 1 秒"); return; }
+  const full = new Float32Array(len);
+  let o = 0;
+  for (const c of chunks) { full.set(c, o); o += c.length; }
+  const pcm = downsampleTo16k(full, ctx.sampleRate);
+  const blob = encodeWav(pcm, 16000);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const file = new File([blob], `rec-${stamp}.wav`, { type: "audio/wav" });
+  uploadFile(file);            // also attach as agent context
+  analyzeFiles([file], true);  // instant local report
+}
+function downsampleTo16k(buf, from) {
+  const to = 16000;
+  if (from === to) return buf;
+  if (from < to) return buf; // upsampling not expected for mics
+  const ratio = from / to;
+  // anti-alias: windowed-sinc low-pass just below the target Nyquist (8 kHz)
+  // before decimation — plain box-averaging folds HF energy into the voice band
+  const cutoff = 0.42 / ratio;                 // normalised (Nyquist = 1.0)
+  const taps = 33;
+  const h = new Float32Array(taps);
+  const mid = (taps - 1) / 2;
+  let hsum = 0;
+  for (let i = 0; i < taps; i++) {
+    const t = (i - mid) / taps;
+    const sinc = 2 * cutoff * (Math.abs(t) < 1e-9 ? 1 : Math.sin(Math.PI * 2 * cutoff * (i - mid)) / (Math.PI * (i - mid)));
+    h[i] = sinc * (0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (taps - 1))); // Hamming
+    hsum += h[i];
+  }
+  for (let i = 0; i < taps; i++) h[i] /= hsum;
+  const n = Math.floor(buf.length / ratio);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const c = Math.round(i * ratio);
+    let s = 0;
+    for (let j = 0; j < taps; j++) {
+      const k = c - mid + j;
+      if (k >= 0 && k < buf.length) s += h[j] * buf[k];
+    }
+    out[i] = s;
+  }
+  return out;
+}
+function encodeWav(samples, sr) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, samples.length * 2, true);
+  let o = 44;
+  for (let i = 0; i < samples.length; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+// ---------- spectrogram (canvas) ----------
+function spectrogramEl(spec, name) {
+  const box = document.createElement("div");
+  box.className = "contour-box";
+  const title = document.createElement("div");
+  title.className = "contour-title";
+  title.textContent = `语谱图 — ${name}`;
+  box.appendChild(title);
+  const rows = spec.freqs_hz.length, cols = spec.times_s.length;
+  if (!rows || !cols || !spec.values_db?.length) return box;
+  const cv = document.createElement("canvas");
+  const W = 640, H = 220;
+  cv.width = W; cv.height = H;
+  const g = cv.getContext("2d");
+  let lo = Infinity, hi = -Infinity;
+  for (const row of spec.values_db) for (const v of row) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const cw = W / cols, ch = (H - 18) / rows;
+  for (let f = 0; f < rows; f++) {
+    for (let t = 0; t < cols; t++) {
+      const v = (spec.values_db[f][t] - lo) / Math.max(hi - lo, 1);
+      g.fillStyle = heatColor(v);
+      g.fillRect(t * cw, H - 18 - (f + 1) * ch, Math.ceil(cw) + 1, Math.ceil(ch) + 1);
+    }
+  }
+  g.fillStyle = "rgba(232,234,240,.75)"; g.font = "10px sans-serif";
+  const fmax = spec.freqs_hz[rows - 1];
+  [0, 0.5, 1].forEach(p => {
+    g.fillText(Math.round(fmax * p) + " Hz", 4, H - 18 - p * (H - 18) + 3);
+    g.fillText((p * spec.t_max).toFixed(1) + "s", Math.min(p * W + 3, W - 32), H - 5);
+  });
+  box.appendChild(cv);
+  return box;
+}
+function heatColor(v) {
+  const r = Math.min(255, Math.round(255 * Math.min(1, v * 1.9)));
+  const g = Math.min(255, Math.round(255 * Math.max(0, v * 1.7 - 0.55)));
+  const b = Math.round(90 * Math.max(0, 1 - v * 3.5));
+  return `rgb(${r},${g},${b})`;
+}
+
+// ---------- longitudinal trend tracking (localStorage) ----------
+function saveTrend(r) {
+  try {
+    const list = JSON.parse(localStorage.getItem("sl_trends") || "[]");
+    list.push({
+      ts: Date.now(), file: r.file || "—",
+      f0: r.pitch?.f0_median_hz ?? null,
+      jitter: r.voice_quality?.jitter_local_percent ?? null,
+      shimmer: r.voice_quality?.shimmer_local_db ?? null,
+      hnr: r.hnr_db ?? null,
+    });
+    while (list.length > 100) list.shift();
+    localStorage.setItem("sl_trends", JSON.stringify(list));
+  } catch (e) { /* private mode etc. */ }
+}
+$("btn-trend").onclick = () => { renderTrend(); $("trend-modal").classList.add("open"); };
+$("trend-close").onclick = () => $("trend-modal").classList.remove("open");
+$("trend-clear").onclick = async () => {
+  if (!confirm("清空本机与服务器上保存的全部测量历史？")) return;
+  localStorage.removeItem("sl_trends");
+  try { await fetch("/api/trends", { method: "DELETE", headers: apiHeaders() }); } catch (e) { /* noop */ }
+  renderTrend();
+};
+
+async function fetchTrendList() {
+  // local (this browser) + server (this user key, any device), deduped
+  let local = [];
+  try { local = JSON.parse(localStorage.getItem("sl_trends") || "[]"); } catch (e) { /* noop */ }
+  let server = [];
+  try {
+    const r = await fetch("/api/trends", { headers: apiHeaders() });
+    const d = await r.json();
+    server = (d.measurements || []).map((m) => ({
+      ts: (m.ts || 0) * 1000, file: m.file || "—", src: "server",
+      f0: m.f0, jitter: m.jitter, shimmer: m.shimmer, hnr: m.hnr,
+    }));
+  } catch (e) { /* server unreachable → local only */ }
+  const seen = new Set();
+  const merged = [];
+  for (const e of [...local.map((x) => ({ ...x, src: x.src || "local" })), ...server]) {
+    const key = `${Math.round((e.ts || 0) / 1000)}|${e.file}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(e);
+  }
+  merged.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  return merged;
+}
+
+async function renderTrend() {
+  const body = $("trend-body");
+  const list = await fetchTrendList();
+  if (!list.length) {
+    body.innerHTML = '<p style="color:var(--muted)">还没有历史测量。用 📊 分析或 🎤 录音后，结果会自动记录并跨设备同步，适合追踪治疗/训练前后的变化。</p>';
+    return;
+  }
+  const metrics = [
+    ["F0 中位数 (Hz)", "f0"], ["Jitter (%)", "jitter"],
+    ["Shimmer (dB)", "shimmer"], ["HNR (dB)", "hnr"],
+  ];
+  let html = "";
+  for (const [label, key] of metrics) {
+    const pts = list.map((e, i) => [i, e[key]]).filter(p => p[1] != null && !isNaN(p[1]));
+    if (pts.length < 2) continue;
+    const W = 560, H = 80;
+    const vs = pts.map(p => p[1]);
+    let lo = Math.min(...vs), hi = Math.max(...vs);
+    if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+    const X = (i) => 8 + (i / (list.length - 1)) * (W - 40);
+    const Y = (v) => 8 + (1 - (v - lo) / (hi - lo)) * (H - 20);
+    const poly = pts.map(p => `${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join(" ");
+    const last = vs[vs.length - 1];
+    html += `<div class="trend-chart"><div class="tc-title">${label} — 最新 ${(+last).toFixed(2)}，范围 ${(+lo).toFixed(2)}–${(+hi).toFixed(2)}，共 ${pts.length} 次</div>
+      <svg viewBox="0 0 ${W} ${H}"><rect width="${W}" height="${H}" fill="#12141c" rx="6"/>
+      <line x1="8" x2="${W - 32}" y1="${Y(last).toFixed(1)}" y2="${Y(last).toFixed(1)}" stroke="var(--border)" stroke-dasharray="3 3"/>
+      <polyline fill="none" stroke="var(--accent)" stroke-width="1.8" points="${poly}"/>
+      ${pts.map(p => `<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="2.2" fill="var(--accent)"/>`).join("")}
+      </svg></div>`;
+  }
+  const rowsHtml = [...list].slice(-15).reverse().map(e => {
+    const d = new Date(e.ts);
+    const fmt = (v, p = 2) => (v == null || isNaN(v)) ? "—" : (+v).toFixed(p);
+    return `<tr><td>${d.toLocaleString()}</td><td>${escapeHtml(String(e.file))}</td>
+      <td>${fmt(e.f0, 1)}</td><td>${fmt(e.jitter)}</td><td>${fmt(e.shimmer)}</td><td>${fmt(e.hnr, 1)}</td></tr>`;
+  }).join("");
+  html += `<table class="trend-table"><thead><tr><th>时间</th><th>文件</th><th>F0 Hz</th><th>Jitter %</th><th>Shimmer dB</th><th>HNR dB</th></tr></thead><tbody>${rowsHtml}</tbody></table>`;
+  body.innerHTML = html || '<p style="color:var(--muted)">数据不足（同一指标至少需要 2 次测量才能画趋势）。</p>';
+}
+
+// ---------- markdown report export ----------
+function exportBtn(r) {
+  const b = document.createElement("button");
+  b.className = "exp-btn";
+  b.textContent = "⬇ 导出报告 (.md)";
+  b.onclick = () => {
+    const blob = new Blob([mdReport(r)], { type: "text/markdown;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (r.file || "report").replace(/\.[^.]+$/, "") + "-报告.md";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  return b;
+}
+function mdReport(r) {
+  const p = r.pitch || {}, v = r.voice_quality || {}, q = r.recording_quality || {}, ps = r.pause_stats || {};
+  const L = [];
+  L.push(`# 声学分析报告 — ${r.file}`, "");
+  L.push(`- 分析时间：${new Date().toLocaleString()}`);
+  L.push(`- 时长：${r.duration_s} s，采样率 ${r.sample_rate_hz} Hz`);
+  L.push("");
+  L.push("## 基频 (F0)", "");
+  L.push(`| 指标 | 数值 |`, `| --- | --- |`);
+  L.push(`| 中位数 | ${p.f0_median_hz?.toFixed?.(1) ?? "—"} Hz |`);
+  L.push(`| 均值 ± 标准差 | ${p.f0_mean_hz?.toFixed?.(1) ?? "—"} ± ${p.f0_std_hz?.toFixed?.(1) ?? "—"} Hz |`);
+  L.push(`| 范围 | ${p.f0_min_hz?.toFixed?.(0) ?? "—"}–${p.f0_max_hz?.toFixed?.(0) ?? "—"} Hz |`);
+  L.push(`| 浊音帧占比 | ${((p.voiced_ratio ?? 0) * 100).toFixed(0)} % |`);
+  L.push("");
+  L.push("## 嗓音质量", "");
+  L.push(`| 指标 | 数值 | 参考范围 |`, `| --- | --- | --- |`);
+  L.push(`| Jitter (local) | ${v.jitter_local_percent?.toFixed?.(2) ?? "—"} % | < 1.0 % |`);
+  L.push(`| Shimmer (local) | ${v.shimmer_local_db?.toFixed?.(2) ?? "—"} dB | < 0.35 dB |`);
+  L.push(`| HNR | ${r.hnr_db ?? "—"} dB | > 20 dB |`);
+  L.push(`| 分析周期数 | ${v.n_periods ?? "—"} | |`);
+  L.push("");
+  if (r.formants) {
+    L.push("## 共振峰", "", `F1 ${r.formants.F1_hz?.toFixed?.(0)} / F2 ${r.formants.F2_hz?.toFixed?.(0)} / F3 ${r.formants.F3_hz?.toFixed?.(0)} Hz`, "");
+  }
+  if (ps.speech_s != null) {
+    L.push("## 时间结构", "");
+    L.push(`语音 ${ps.speech_s}s，静音占比 ${((ps.silence_ratio || 0) * 100).toFixed(0)}%，停顿 ${ps.n_pauses} 次`);
+    if (ps.articulation_rate_syl_per_s) L.push(`，估算发音速率 ${ps.articulation_rate_syl_per_s} 音节/s`);
+    L.push("");
+  }
+  L.push("## 录音质量", "", `峰值 ${q.peak_dbfs} dBFS，SNR ${q.snr_db ?? "—"} dB`);
+  if (q.issues?.length) L.push(`，问题：${q.issues.join("；")}`);
+  L.push("");
+  if (q.issues?.length) L.push("> ⚠️ 上述录音质量问题可能影响测量可靠性，建议重新录制后再行分析。");
+  L.push("", "> 本报告由 SpeechLab Agent 本地声学分析生成，供研究分诊参考；临床决策请结合 Praat/VoiceSauce 交叉验证与专业评估。");
+  return L.join("\n");
+}
+
+loadServerConfig();
+$("input").focus();
+</script>
+</body>
+</html>

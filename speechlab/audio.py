@@ -54,13 +54,25 @@ class AudioData:
 
 def _wav_to_float(raw: bytes, sampwidth: int, dtype_code: str) -> np.ndarray:
     """Convert raw WAV bytes to float64 in [-1, 1]."""
+    if sampwidth == 1:
+        # WAV 8-bit PCM is UNSIGNED with midpoint 128
+        vals = np.frombuffer(raw, dtype=np.uint8).astype(np.float64)
+        return (vals - 128.0) / 128.0
     if dtype_code == "f":  # 32/64-bit float PCM already in native range
         return np.frombuffer(raw, dtype="<f4" if sampwidth == 4 else "<f8").astype(np.float64)
-    fmt = {1: "b", 2: "h", 3: "i", 4: "i"}[sampwidth]
-    n_bytes = {"b": 1, "h": 2, "i": 4}[fmt]
+    fmt = {2: "h", 3: "i", 4: "i"}[sampwidth]
+    n_bytes = {"h": 2, "i": 4}[fmt]
     vals = np.frombuffer(raw, dtype=np.dtype(fmt).newbyteorder("<"))
     peak = float(2 ** (8 * n_bytes - 1))
     return vals.astype(np.float64) / peak
+
+
+def _pcm24_to_float(raw: bytes) -> np.ndarray:
+    """Vectorised little-endian signed 24-bit PCM → float64 in [-1, 1]."""
+    b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+    val = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+    val = np.where(val >= 0x800000, val - 0x1000000, val)
+    return val.astype(np.float64) / 8388608.0
 
 
 def load_audio(path: str, target_sr: int | None = None) -> AudioData:
@@ -110,16 +122,7 @@ def load_audio(path: str, target_sr: int | None = None) -> AudioData:
             if wf.getcomptype() != "NONE":
                 raise ValueError("compressed WAV is not supported")
         if sampwidth == 3:  # 24-bit PCM needs manual unpacking
-            n = len(raw) // 3
-            ints = np.empty(n, dtype=np.int32)
-            for i in range(n):
-                b = raw[i * 3 : i * 3 + 3]
-                # little-endian 24-bit signed
-                val = b[0] | (b[1] << 8) | (b[2] << 16)
-                if val & 0x800000:
-                    val -= 0x1000000
-                ints[i] = val
-            samples = ints.astype(np.float64) / 8388608.0
+            samples = _pcm24_to_float(raw)
         else:
             samples = _wav_to_float(raw, sampwidth, wf_dtype(sampwidth))
         if n_channels > 1:

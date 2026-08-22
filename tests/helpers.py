@@ -45,6 +45,44 @@ def noise(duration_s: float, sr: int = 16000, amp: float = 0.1,
     return amp * rng.standard_normal(round(duration_s * sr))
 
 
+def perturbed_vowel(f0_hz: float = 120.0, duration_s: float = 1.0,
+                    sr: int = 16000, amp_factors=None, period_factors=None,
+                    formants=((500.0, 1.0), (1500.0, 0.6), (2440.0, 0.3)),
+                    ) -> np.ndarray:
+    """Impulse-train vowel with *exact* per-period amplitude/period control.
+
+    ``amp_factors`` / ``period_factors`` are sequences indexed per glottal
+    period (cycled if shorter than the utterance); ``None`` means no
+    perturbation.  Unlike :func:`vowel_like`, the perturbation lands on
+    whole periods, so designed jitter/shimmer values can be asserted
+    analytically — e.g. alternating amplitudes (1, 2) must yield a local
+    shimmer of 20·log10(2) ≈ 6.02 dB.
+    """
+    from scipy.signal import lfilter
+
+    n = round(duration_s * sr)
+    src = np.zeros(n)
+    pos = 0.0
+    k = 0
+    while pos < n:
+        idx = round(pos)
+        if idx < n:
+            a = amp_factors[k % len(amp_factors)] if amp_factors is not None else 1.0
+            src[idx] = a
+        p = period_factors[k % len(period_factors)] if period_factors is not None else 1.0
+        pos += (sr / f0_hz) * p
+        k += 1
+
+    out = np.zeros(n)
+    for f_hz, bw in formants:
+        r = np.exp(-np.pi * 80.0 / sr)
+        theta = 2 * np.pi * f_hz / sr
+        a = np.array([1.0, -2 * r * np.cos(theta), r * r])
+        out += bw * lfilter([(1 - r) ** 2], a, src)
+    out /= np.max(np.abs(out)) + 1e-12
+    return 0.8 * out
+
+
 def write_wav(path: str, samples: np.ndarray, sr: int) -> str:
     """Write float samples to a 16-bit PCM WAV file."""
     x = np.clip(np.asarray(samples, dtype=np.float64), -1.0, 1.0 - 1e-9)

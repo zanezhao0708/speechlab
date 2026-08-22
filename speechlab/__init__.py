@@ -8,6 +8,8 @@ Modules
 audio    : loading, resampling and basic audio utilities.
 features : the acoustic analysis core the agent calls as a tool
            (F0, formants, jitter/shimmer, HNR).
+praat    : optional publication-grade backend via praat-parselmouth
+           (``analyze(audio, backend="praat")``).
 agent    : the LLM research assistant with the tool-calling loop.
 cli      : command line interface.
 """
@@ -20,4 +22,5 @@ __all__ = [
     "audio",
     "cli",
     "features",
+    "praat",
 ]

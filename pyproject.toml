@@ -27,12 +27,15 @@ dependencies = [
 [project.optional-dependencies]
 soundfile = ["soundfile>=0.12"]
 dev = ["pytest>=7", "ruff>=0.4"]
+web = ["flask>=3.0"]
+bench = ["praat-parselmouth>=0.4", "matplotlib>=3.7"]
 
 [project.scripts]
 speechlab = "speechlab.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/speechlab/speechlab"
+Homepage = "https://github.com/zanezhao0708/speechlab"
+Issues = "https://github.com/zanezhao0708/speechlab/issues"
 
 [tool.setuptools.packages.find]
 include = ["speechlab*"]

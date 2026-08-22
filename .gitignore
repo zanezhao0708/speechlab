@@ -15,3 +15,5 @@ htmlcov/
 *.flac
 *.mp3
 !tests/data/**
+web/data/
+bench_results/
