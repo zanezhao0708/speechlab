@@ -484,6 +484,17 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
     each period (validated against native Praat on perturbed synthetic
     vowels; see ``benchmarks/praat_benchmark.py``).
 
+    Both averages exclude pairs that fail Praat's stability factors —
+    consecutive periods differing by more than 1.3x (``maxPeriodFactor``)
+    for jitter, amplitudes differing by more than 1.6x
+    (``maxPeakFactor``) for shimmer.  On connected speech a peak-picking
+    epoch walker occasionally splits or skips a period around consonant
+    transitions; without the exclusion a handful of such glitches dominates
+    the mean (a 100-file CMU Arctic run measured a median 44 % jitter
+    against Praat's 1.8 % before this rule).  A pair that fails the factor
+    is by definition not a reliable period measurement, so excluding it
+    measures the stability of the voice, not of the epoch picker.
+
     Commonly cited sustained-vowel screening values are jitter < 1 %,
     shimmer < 0.4 dB — but these thresholds are algorithm-, recording- and
     population-dependent (Praat's own docs stress the sustained-vowel
@@ -504,13 +515,23 @@ def jitter_shimmer(samples: np.ndarray, sr: int, fmin: float = 60.0,
                              shimmer_local_db=float("nan"), n_periods=0)
 
     periods = np.diff(epochs) / sr
-    jitter = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods) * 100.0)
+    # Praat's maxPeriodFactor: exclude pairs whose periods differ by >1.3x
+    p_ratio = np.maximum(periods[1:] / periods[:-1],
+                         periods[:-1] / periods[1:])
+    stable = p_ratio <= 1.3
+    if np.any(stable):
+        jitter = float(np.mean(np.abs(np.diff(periods))[stable])
+                       / np.mean(periods) * 100.0)
+    else:  # no stable pair at all: perturbation is undefined, not zero
+        jitter = float("nan")
     return JitterShimmer(jitter_local_percent=jitter,
-                         shimmer_local_db=_shimmer_local_db(amps),
+                         shimmer_local_db=_shimmer_local_db(
+                             amps, max_peak_factor=1.6),
                          n_periods=len(periods))
 
 
-def _shimmer_local_db(amps: np.ndarray) -> float:
+def _shimmer_local_db(amps: np.ndarray,
+                      max_peak_factor: float | None = None) -> float:
     """Praat's *shimmer (local, dB)* from per-period amplitudes.
 
     The average of ``|20·log10(A_{k+1}/A_k)|`` over consecutive periods.
@@ -519,11 +540,19 @@ def _shimmer_local_db(amps: np.ndarray) -> float:
     ``20·log10(A_last/A_first)`` — a signal whose amplitudes swing
     1 → 2 → 1 → 2 … would report ~0 dB instead of 6.02 dB, measuring
     envelope drift rather than cycle-to-cycle perturbation.
+
+    ``max_peak_factor`` (Praat's default 1.6 in "Get shimmer (local_dB)")
+    excludes consecutive pairs whose amplitudes differ by more than that
+    factor — the same glitch robustness convention as jitter's
+    ``maxPeriodFactor``.  ``None`` keeps every pair (pure formula).
     """
     amps = np.asarray(amps, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         amp_ratios = amps[1:] / np.where(np.abs(amps[:-1]) < 1e-12, np.nan, amps[:-1])
         db_steps = 20.0 * np.log10(amp_ratios)
+        if max_peak_factor is not None:
+            keep = np.maximum(amp_ratios, 1.0 / amp_ratios) <= max_peak_factor
+            db_steps = db_steps[keep]
         return float(np.nanmean(np.abs(db_steps))) \
             if np.any(np.isfinite(db_steps)) else float("nan")
 
