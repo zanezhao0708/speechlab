@@ -73,6 +73,11 @@ def test_jitter_shimmer_periodic_signal():
     assert js.n_periods >= 50
     assert js.jitter_local_percent < 2.0  # synthetic voice is very stable
     assert js.shimmer_local_db < 1.0
+    # lower bounds: both measures are averages of absolute quantities and
+    # cannot be negative — an upper-bound-only assertion let the public
+    # repo's sign-cancelling shimmer bug pass on a ~0 dB average
+    assert js.jitter_local_percent >= 0.0
+    assert js.shimmer_local_db >= 0.0
 
 
 def test_jitter_shimmer_too_short():
