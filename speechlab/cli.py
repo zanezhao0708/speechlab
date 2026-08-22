@@ -36,9 +36,11 @@ def info(path: str) -> None:
 @main.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--json", "as_json", is_flag=True, help="emit raw JSON instead of a table")
-def analyze_cmd(path: str, as_json: bool) -> None:
+@click.option("--backend", type=click.Choice(["native", "praat"]), default="native",
+              help="measurement engine: native (default) or praat via praat-parselmouth")
+def analyze_cmd(path: str, as_json: bool, backend: str) -> None:
     """Acoustic analysis the agent uses: F0, voice quality, HNR, formants."""
-    report = analyze(load_audio(path))
+    report = analyze(load_audio(path), backend=backend)
     if as_json:
         click.echo(json.dumps(report, indent=2, ensure_ascii=False))
         return
@@ -74,7 +76,7 @@ main.add_command(analyze_cmd, name="analyze")
 
 #: columns exported by ``speechlab batch`` for R / SPSS / pandas
 _BATCH_COLUMNS = [
-    "file", "duration_s", "sample_rate_hz",
+    "file", "duration_s", "sample_rate_hz", "backend",
     "f0_median_hz", "f0_mean_hz", "f0_std_hz", "f0_min_hz", "f0_max_hz",
     "voiced_ratio", "jitter_local_percent", "shimmer_local_db", "n_periods",
     "hnr_db", "F1_hz", "F2_hz", "F3_hz",
@@ -86,12 +88,14 @@ _BATCH_COLUMNS = [
 @click.argument("paths", type=click.Path(exists=True), nargs=-1, required=True)
 @click.option("--csv", "csv_path", type=click.Path(writable=True), default=None,
               help="also write a CSV table (one row per file) for R/SPSS/pandas")
-def batch(paths: tuple[str, ...], csv_path: str | None) -> None:
+@click.option("--backend", type=click.Choice(["native", "praat"]), default="native",
+              help="measurement engine: native (default) or praat via praat-parselmouth")
+def batch(paths: tuple[str, ...], csv_path: str | None, backend: str) -> None:
     """Analyse many recordings at once; optional CSV export."""
     rows = []
     for path in paths:
         try:
-            report = analyze(load_audio(path))
+            report = analyze(load_audio(path), backend=backend)
         except Exception as exc:  # noqa: BLE001 — keep going through bad files
             click.echo(f"[skip] {path}: {exc}", err=True)
             continue
@@ -101,6 +105,7 @@ def batch(paths: tuple[str, ...], csv_path: str | None) -> None:
             "file": os.path.basename(path),
             "duration_s": report["duration_s"],
             "sample_rate_hz": report["sample_rate_hz"],
+            "backend": report.get("backend", "native"),
             "f0_median_hz": round(p.get("f0_median_hz", float("nan")), 2),
             "f0_mean_hz": round(p.get("f0_mean_hz", float("nan")), 2),
             "f0_std_hz": round(p.get("f0_std_hz", float("nan")), 2),

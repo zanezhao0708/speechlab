@@ -1087,8 +1087,16 @@ def _resample_for_formants(x: np.ndarray, sr: int,
 
 
 def analyze(audio: AudioData, contour: bool = False,
-            formant_ceiling: float = FORMANT_CEILING_HZ) -> dict:
+            formant_ceiling: float = FORMANT_CEILING_HZ,
+            backend: str = "native") -> dict:
     """Run a standard acoustic analysis and return a JSON-ready dict.
+
+    ``backend`` selects the measurement engine: ``"native"`` (default) is
+    the lightweight numpy/scipy implementation; ``"praat"`` computes the
+    same report through praat-parselmouth for publication-grade numbers
+    (install with ``pip install -e ".[bench]"``).  Every report carries a
+    ``backend`` field so numbers stay traceable to the engine that
+    produced them.
 
     ``formants`` carries not just the median F1–F3 but how trustworthy
     each median is: the number of frames behind it, the interquartile
@@ -1102,6 +1110,12 @@ def analyze(audio: AudioData, contour: bool = False,
     plotting.  ``formant_ceiling`` follows Praat's Formant(Burg)
     convention: the signal is resampled to twice the ceiling before LPC.
     """
+    if backend == "praat":
+        from .praat import analyze_praat  # local import: no hard dep, no cycle
+        return analyze_praat(audio, contour=contour,
+                             formant_ceiling=formant_ceiling)
+    if backend != "native":
+        raise ValueError(f"unknown backend {backend!r}: use 'native' or 'praat'")
     sr, x = audio.sample_rate, audio.samples
     # pitch is the most expensive stage — compute once and share it with
     # the jitter/shimmer and HNR estimators
@@ -1178,6 +1192,7 @@ def analyze(audio: AudioData, contour: bool = False,
         "duration_s": round(audio.duration, 3),
         "sample_rate_hz": sr,
         "n_samples": int(audio.num_samples),
+        "backend": "native",
         "pitch": track.summary(),
         "voice_quality": js.summary(),
         "voice_quality_segment_s": (js_segment["start_s"], js_segment["end_s"])

@@ -68,8 +68,10 @@ Ground rules:
    thresholds are algorithm-, recording- and population-dependent, are
    defined for sustained vowels, and serve research triage only — they are
    not diagnostic, and clinical decisions require a certified professional.
-   For publication-grade numbers, recommend cross-checking with Praat or
-   VoiceSauce on the same recordings.
+   For publication-grade numbers, analyse with backend="praat" (Praat via
+   praat-parselmouth) when available, and recommend cross-checking with
+   Praat or VoiceSauce on the same recordings; always state which backend
+   produced the numbers (report["backend"]).
 3. Suggest concrete, feasible next steps: analyses to run, confounds to
    control, or papers/methods to consider.
 4. Be honest about uncertainty; distinguish established results from
@@ -194,6 +196,11 @@ def build_tool_specs() -> list[dict]:
                         "path": {"type": "string", "description": (
                             "path to the audio file; must be inside the "
                             "agent's allowed workspace directories")},
+                        "backend": {"type": "string", "enum": ["native", "praat"],
+                                    "description": (
+                                        "measurement engine: native = lightweight "
+                                        "built-in (default); praat = publication-grade "
+                                        "via praat-parselmouth (needs the bench extra)")},
                     },
                     "required": ["path"],
                 },
@@ -376,7 +383,10 @@ class SpeechResearchAgent:
 
         def analyze_audio(args: dict) -> dict:
             audio = _load(args["path"])
-            report = _analyze_audio(audio)
+            try:
+                report = _analyze_audio(audio, backend=args.get("backend", "native"))
+            except RuntimeError as exc:  # praat-parselmouth not installed
+                return {"error": str(exc)}
             report["file"] = _display(str(audio.path or args["path"]))
             return report
 

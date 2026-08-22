@@ -12,6 +12,8 @@ import wave
 import numpy as np
 import pytest
 
+pytest.importorskip("flask", reason="web extra not installed: pip install -e '.[web]'")
+
 import web.app as webapp
 from web.app import app
 from web.store import Store

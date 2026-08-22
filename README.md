@@ -68,10 +68,12 @@ speechlab agent "Interpret these voice measures" --context patient.wav
 
 # the analysis the agent runs under the hood, standalone:
 speechlab analyze patient.wav
+speechlab analyze patient.wav --backend praat   # publication-grade (see below)
 speechlab info patient.wav
 
 # batch-analyse many files, one CSV row per file (20+ measures):
 speechlab batch recordings/*.wav --csv results.csv
+speechlab batch recordings/*.wav --backend praat --csv results.csv
 ```
 
 ## Web chat interface
@@ -199,9 +201,13 @@ certified professionals.
 
 ## Method notes
 
-- **F0**: 25 ms / 10 ms frames, normalised cross-correlation over 60–500 Hz,
-  shortest-lag-within-tolerance peak picking (anti-subharmonic), parabolic
-  refinement, 3-frame median smoothing.
+- **F0**: 25 ms / 10 ms frames (3 periods of the pitch floor, whichever is
+  longer), Boersma's window-corrected normalised autocorrelation over
+  60–500 Hz, octave-robust period selection (candidates within tolerance
+  of the maximum; a half-period is rejected when the 2× lag peaks clearly
+  higher; a candidate survives only if its small multiples all show NCCF
+  peaks — the anti-subharmonic chain check), parabolic refinement on the
+  raw NCCF, 3-frame median smoothing over voiced frames.
 - **Formants**: LPC (Levinson–Durbin) on 25 ms frames following Praat's
   Formant(Burg) conventions — the signal is first resampled to twice the
   formant ceiling (5.5 kHz by default), pre-emphasis uses Praat's exact
@@ -266,12 +272,41 @@ installed.
 > formant and perturbation values as screening-grade, and cross-check
 > publication-grade numbers against Praat / VoiceSauce.
 >
-> Current synthetic-set agreement (20 source-filter vowels, clean/noisy/
-> 8 kHz conditions): F1 MAE 23 Hz (r = 0.91), F2 103 Hz (r = 0.91),
-> F3 67 Hz (r = 0.99), HNR r = 0.97. Jitter/shimmer correlate weakly with
-> Praat (r ≈ 0.15–0.32) — the epoch-based lightweight estimators differ
-> from Praat's point-process definitions, so use them for triage, not
-> publication numbers.
+> Current synthetic-set agreement (24 source-filter vowels across
+> clean/noisy/jittered/shimmered/8 kHz conditions): per-file median F0
+> r = 1.000 (bias −0.17 Hz, LoA ±1.5 Hz, zero octave errors), F1 MAE
+> 20 Hz (r = 0.92), F2 90 Hz (r = 0.91), F3 74 Hz (r = 0.97), HNR
+> r = 0.98 (bias −1.8 dB). Jitter r = 0.88 (bias +0.6 %), shimmer
+> r = 0.89 (bias +0.2 dB) — the epoch-based estimators track Praat's
+> point-process definitions closely on synthetic vowels but remain
+> triage-grade until real-speech validation lands.
+
+## Praat backend (publication-grade)
+
+When numbers must sit next to Praat-derived values in a paper, switch the
+measurement engine instead of hand-cross-checking: `backend="praat"`
+computes the identical report schema through the official
+[`praat-parselmouth`](https://github.com/praat/praat) binding — Praat's own
+`To Pitch (ac)`, `To Formant (burg)`, `To PointProcess (periodic, cc)`
+and `To Harmonicity (cc)`, with jitter/shimmer/HNR on the longest voiced
+segment (Praat's sustained-vowel convention).
+
+```bash
+pip install -e ".[bench]"          # adds praat-parselmouth
+speechlab analyze vowel.wav --backend praat
+speechlab batch corpus/*.wav --backend praat --csv results.csv
+```
+
+```python
+from speechlab.features import analyze
+report = analyze(audio, backend="praat")     # same keys as native
+report["backend"]                            # -> "praat-parselmouth 0.4.7"
+```
+
+Every report (both engines) carries a `backend` field, and the batch CSV
+exports it as a column, so exported numbers stay traceable to the engine
+that produced them. The agent's `analyze_audio` tool also accepts
+`backend: "praat"` and will state which engine produced its numbers.
 
 ## Example
 

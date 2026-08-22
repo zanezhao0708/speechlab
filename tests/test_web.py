@@ -8,6 +8,8 @@ import wave
 import numpy as np
 import pytest
 
+pytest.importorskip("flask", reason="web extra not installed: pip install -e '.[web]'")
+
 from web.app import _ANALYSIS_CACHE, app
 
 
